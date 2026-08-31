@@ -1,0 +1,301 @@
+# PROJECT MASTER BLUEPRINT v3: MULTI-PAIR FUTURES PMM ENGINE (HEDGE MODE)
+
+**Codename:** OpenPMM-Engine
+**Target:** Engine PMM **Futures-only, Hedge Mode native** cho 20–30 cặp đồng thời, đầy đủ chức năng tương đương **PMM Simple (V2) + Perpetual Market Making** của Hummingbot, nhưng single-process asyncio gọn nhẹ, loại bỏ FSM/MQTT cồng kềnh và triệt để lỗi desync.
+**Tech Stack:** Python 3.11+, asyncio, ccxt.pro (WebSocket), FastAPI, NiceGUI, SQLite (WAL) + JSON config.
+
+**Quyết định kiến trúc chính (v3):**
+1. **Hedge Mode từ v1:** mỗi symbol có 2 slot vị thế độc lập — LONG và SHORT. Executor được key theo `(symbol, positionSide)`. Phù hợp bản chất PMM: bid fill → ôm LONG, ask fill → ôm SHORT, hai phía quản lý exit độc lập.
+2. **Position Executor + Triple Barrier** (Stop Loss / Take Profit / Trailing Stop / Time Limit) tương đương PMM Simple V2 — exit order treo sẵn, không refresh liên tục → tiết kiệm rate limit.
+3. **Private WS là nguồn truth** cho fill; local state chỉ là cache; REST reconcile 60s + bắt buộc sau reconnect/restart.
+
+---
+
+## 1. Hệ quả của Hedge Mode lên thiết kế (đọc kỹ trước khi code)
+
+| Điểm | One-Way (đã bỏ) | Hedge Mode (v3 chuẩn) |
+|------|-----------------|------------------------|
+| Đóng vị thế | `reduceOnly=true` | **`reduceOnly` không hợp lệ**. Đóng LONG = SELL với `positionSide=LONG`; đóng SHORT = BUY với `positionSide=SHORT`. Không bao giờ dùng `closePosition=true` (Binance từ chối trong Hedge mode) |
+| SL server-side | STOP_MARKET `closePosition=true` | STOP_MARKET + `positionSide` + **quantity chính xác** → Executor phải **amend SL quantity** mỗi khi TP chốt từng phần (tránh SL đóng thừa/lật vị thế) |
+| Inventory | 1 giá trị net | 2 giá trị: `long_value`, `short_value`. Net = 0 **không có nghĩa** là không rủi ro (gross exposure = long + short) |
+| Skew | 1 ρ theo net | **Skew 2 phía độc lập** (§3.2): ρ_long điều khiển bid side, ρ_short điều khiển ask side |
+| Margin | Tỷ lệ thuận net exposure | Hedge ôm 2 phía → **gross margin gấp đôi**; cần `max_long_usdt` + `max_short_usdt` riêng và guard tổng gross |
+| Kill-All | Market close reduceOnly | Đóng từng `positionSide` ≠ 0 bằng lệnh MARKET ngược chiều + `positionSide`; re-fetch xác nhận = 0 |
+| Startup check | — | Bắt buộc `GET positionSide/dual`: nếu sàn đang One-Way → tự chuyển sang Hedge (chỉ khi không có vị thế/lệnh mở), nếu không chuyển được → **abort + alert**, tuyệt đối không chạy sai mode |
+| Bybit | — | Hedge mode qua position `idx` (1=Buy side, 2=Sell side) — gateway phải map thống nhất sang `positionSide` LONG/SHORT nội bộ |
+
+---
+
+## 2. Feature Parity Matrix với Hummingbot PMM
+
+✅ = parity, 🔶 = cải tiến, ❌ = cố tình loại bỏ.
+
+| Nhóm | Chức năng | HB PMM Simple / Perp MM | OpenPMM-Engine v3 |
+|------|-----------|--------------------------|-------------------|
+| **Quoting** | Bid/ask spread quanh mid | ✅ | ✅ |
+| | Order levels (`order_levels`, `order_level_spread`, `order_level_amount`) | ✅ | ✅ |
+| | Order refresh | ✅ fixed timer | 🔶 Event-driven + timer fallback (§3.3) |
+| | `minimum_spread` | ✅ | ✅ |
+| | `price_ceiling` / `price_floor` | ✅ | ✅ |
+| | Ping-pong | ✅ | ✅ (theo từng side: fill bid → chỉ quote ask-side exit/entry logic của LONG) |
+| | Hanging orders + `hanging_orders_cancel_pct` | ✅ | ✅ |
+| **Inventory** | Skew | ❌ (chỉ Avellaneda controller) | 🔶 Per-side skew, clamp an toàn (§3.2) |
+| **Vị thế** | Take profit + `take_profit_order_type` | ✅ | ✅ + `tp_levels` chốt từng phần |
+| | Stop loss | ✅ client-side retry | 🔶 Server-side STOP_MARKET per positionSide (sống sót khi bot crash) |
+| | Trailing stop (activation + delta) | ✅ | ✅ per side |
+| | Time limit | ✅ | ✅ per side |
+| | Cooldown sau SL | ✅ | ✅ per side |
+| **Rủi ro** | Max position | ✅ | 🔶 `max_long_usdt` + `max_short_usdt` + gross cap |
+| | Post-only enforcement | 🔶 không nhất quán | ✅ GTX bắt buộc + clamp |
+| | Account circuit breaker | ❌ | 🔶 Daily loss + margin-ratio guard (§6.3) |
+| | Volatility filter | ❌ | 🔶 (§3.5) |
+| **Vận hành** | Multi-pair 1 process | ❌ | 🔶 20–30 worker chung event loop |
+| | Hot-reload + Kill-All + Web dashboard | 🔶 | 🔶 NiceGUI chung process |
+| | Backtest | ✅ OHLCV | 🔶 Phase 5: replay + shadow fill |
+
+---
+
+## 3. Kiến trúc hệ thống
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                  NICEGUI DASHBOARD (chung process, port 8502)           │
+│  Grid cards: mỗi cặp hiển thị 2 sub-slot LONG/SHORT (pos, entry, uPnL, │
+│  executor state) │ Config editor │ EMERGENCY KILL-ALL │ PnL attribution │
+└──────────────────────────────▲──────────────────────────────────────────┘
+                               │ in-process event bus
+┌──────────────────────────────▼──────────────────────────────────────────┐
+│                    FASTAPI CONTROL & COORDINATOR                        │
+│  BotManager │ ConfigStore + audit log │ GlobalRateLimiter (ORDERS +     │
+│  WEIGHT, jitter) │ AccountCircuitBreaker │ HedgeModeVerifier (startup)  │
+└──────────────────────────────▲──────────────────────────────────────────┘
+                               │ asyncio.Task per pair
+┌──────────────────────────────▼──────────────────────────────────────────┐
+│                      PMM WORKER × 20–30                                 │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Quoter: levels, per-side skew, ping-pong, hanging, ceiling/floor │  │
+│  │  Executor[LONG]  ── TripleBarrier (TP levels/SL/Trailing/Time)    │  │
+│  │  Executor[SHORT] ── TripleBarrier (TP levels/SL/Trailing/Time)    │  │
+│  │  MarketState: smoothed mid, vol estimator, mark-price check       │  │
+│  │  PositionTracker: 2 slots (LONG/SHORT), fill-driven, reconcile    │  │
+│  │  PairRiskGuard: max_long/short, gross cap, per-pair loss, vol     │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────▲──────────────────────────────────────────┘
+                               │
+┌──────────────────────────────▼──────────────────────────────────────────┐
+│                    EXCHANGE GATEWAY (ccxt.pro)                          │
+│  Public WS per symbol │ PRIVATE WS: watchOrders/watchMyTrades/          │
+│  watchPositions (NGUỒN TRUTH) │ REST: amend/batchOrders (≤5),           │
+│  cancel_all, set_leverage, set_margin_mode, positionSide(dual) check    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 4. Đặc tả thuật toán
+
+### 4.1 Quoting core (PMM Simple parity)
+
+- Smoothed mid (EMA top-of-book), sanity-check chéo mark price; skip chu kỳ nếu book spread bất thường hoặc `|mid − mark|/mark > max_basis_pct`.
+- Level `i` mỗi phía:
+  - `bid_i = r × (1 − s_bid,i)`, `ask_i = r × (1 + s_ask,i)`
+  - `s_bid,i = s_bid_base × vol_mult + skew_bid + i × order_level_spread`
+  - `amount_i = order_amount + i × order_level_amount` (clamp ≥ min notional)
+- Tất cả quote **Post-Only** (Binance: `GTX`; Bybit: `postOnly`). Reject "would immediately match" → lùi level đó 1 tick × retry_step, không bao giờ fallback taker.
+- `minimum_spread`, `price_ceiling`/`price_floor`, `hanging_orders` như parity matrix.
+- **Ping-pong trong Hedge mode:** khi LONG slot đang có vị thế chưa chốt và `ping_pong_enabled` → ngừng mở thêm bid-level (chỉ giữ exit của LONG); phía SHORT vẫn quote bình thường. Tức ping-pong hoạt động **per side**, không khóa toàn cặp.
+
+### 4.2 Per-side inventory skew (Hedge-native, không thể âm spread)
+
+```
+ρ_long  = long_value  / max_long_usdt   ∈ [0, 1]
+ρ_short = short_value / max_short_usdt  ∈ [0, 1]
+ρ_net   = (long_value − short_value) / max(max_long, max_short) ∈ [−1, 1]
+
+r       = m × (1 − γ_net × ρ_net)          # dịch tâm theo NET (nhẹ, optional)
+skew_bid = κ × s_bid_base × ρ_long          # ôm LONG nhiều → bid xa ra (không muốn mua thêm)
+skew_ask = κ × s_ask_base × ρ_short         # ôm SHORT nhiều → ask xa ra
+
+s_bid_eff = max(s_bid_base × vol_mult + skew_bid, spread_floor)
+s_ask_eff = max(s_ask_base × vol_mult + skew_ask, spread_floor)
+spread_floor = 2 × tick_pct + maker_fee_pct + min_spread_buffer
+```
+
+- Đồng thời Executor của phía đang ôm hàng tự kéo TP sát hơn (`tp_skew_boost`: giảm `take_profit` theo ρ của side đó) để tăng xác suất thoát hàng maker.
+- Mọi mọi đường tính giá đều qua `clamp_quote()` duy nhất; unit test bắt buộc: ρ = 0/1, vol_mult max, κ max → spread luôn ≥ floor, giá luôn nằm đúng phía của mid.
+
+### 4.3 Event-driven requote
+
+Requote chỉ khi: (1) mid dịch > `requote_threshold_pct`, (2) có fill, (3) hanging order vượt `hanging_orders_cancel_pct`, (4) timeout fallback `order_refresh_time` (30–120s). Ưu tiên **amend in-place** (`PUT /fapi/v1/order`, batch ≤ 5). Jitter ±20% chống 30 worker bắn đồng pha.
+
+### 4.4 Triple-Barrier Executor (per positionSide)
+
+Mỗi fill entry → tạo/cộng dồn vào Executor của side tương ứng (weighted-average entry):
+
+| Rào chắn | Cơ chế Hedge Mode | Ghi chú |
+|----------|-------------------|---------|
+| `take_profit` / `tp_levels` | Limit post-only đóng side: SELL `positionSide=LONG` / BUY `positionSide=SHORT` tại `entry × (1 ± tp_i)`, qty = % còn lại | `take_profit_order_type`: LIMIT_MAKER (mặc định) / LIMIT / MARKET |
+| `stop_loss` | **STOP_MARKET server-side** + `positionSide` + qty = toàn bộ side position hiện tại | ⚠️ **Phải amend qty mỗi khi TP chốt từng phần** — nếu không SL sẽ đóng thừa → lật vị thế ngược. Đây là bug-class kinh điển của Hedge mode, có unit test riêng |
+| `trailing_stop` | Client-side: kích hoạt ở `activation_price`, trail `trailing_delta`; trigger → hủy TP/SL, đóng MARKET đúng `positionSide` | Giống `TripleBarrierConfig` |
+| `time_limit` | Hết hạn → đóng MARKET đúng `positionSide` | Bắt buộc MARKET |
+| `cooldown_time` | Sau SL → side đó ngừng quote N giây (side kia vẫn chạy) | Per side, không khóa cả cặp |
+
+Ưu tiên xung đột barrier: SL (server) > Trailing trigger > TP > Time limit. Mọi exit đều kiểm tra qty ≤ side position thực (từ PositionTracker đã reconcile).
+
+### 4.5 Volatility filter & funding guard
+
+- `vol_mult = max(1, σ_recent/σ_baseline)`; auto-pause quote (giữ executor) khi: giá dịch > `vol_pause_pct` trong `vol_lookback_sec`, book spread > `max_book_spread_pct`, depth < `min_depth_usdt`, basis bất thường.
+- `funding_avoid_window_sec`: quanh giờ funding, thu `max_long/short` về 0 hoặc pause — tránh ôm inventory trả funding.
+
+---
+
+## 5. Config Schema (Pydantic v2)
+
+```jsonc
+{
+  "symbol": "SOL/USDT:USDT",
+  "exchange": "binance",
+  "enabled": true,
+  "leverage": 5,
+  "margin_mode": "isolated",          // khuyến nghị isolated per-pair
+  // position_mode: HEDGE — global, kiểm tra lúc startup, không per-pair
+
+  // ── Quoting ──
+  "order_amount_usdt": 50.0,
+  "bid_spread": 0.003,
+  "ask_spread": 0.003,
+  "minimum_spread": 0.001,
+  "order_levels": 3,
+  "order_level_spread": 0.002,
+  "order_level_amount": 25.0,
+  "order_refresh_time": 45,
+  "requote_threshold_pct": 0.001,
+  "ping_pong_enabled": false,          // per-side (§4.1)
+  "hanging_orders_enabled": true,
+  "hanging_orders_cancel_pct": 0.02,
+  "price_ceiling": -1,
+  "price_floor": -1,
+
+  // ── Inventory (Hedge: 2 chiều độc lập) ──
+  "inventory_skew_enabled": true,
+  "max_long_usdt": 300.0,
+  "max_short_usdt": 300.0,
+  "gross_exposure_cap_usdt": 450.0,    // long+short ≤ cap (chống ôm 2 phía full)
+  "skew_kappa": 1.0,                   // hệ số widen per-side
+  "skew_gamma_net": 0.001,             # dịch tâm theo net (nhẹ)
+  "tp_skew_boost": 0.5,                # TP siết theo ρ side đang ôm
+
+  // ── Triple barrier (áp dụng cho cả 2 side) ──
+  "take_profit": 0.008,
+  "take_profit_order_type": "LIMIT_MAKER",
+  "tp_levels": [[0.008, 0.6], [0.015, 0.4]],
+  "stop_loss": 0.02,
+  "stop_loss_order_type": "MARKET",
+  "trailing_stop": { "activation_price": 0.012, "trailing_delta": 0.004 },
+  "time_limit": 21600,
+  "cooldown_time": 900,
+
+  // ── Risk & filters ──
+  "max_loss_usdt": 15.0,
+  "daily_loss_limit_usdt": 30.0,
+  "vol_pause_pct": 0.03,
+  "vol_lookback_sec": 60,
+  "max_book_spread_pct": 0.005,
+  "min_depth_usdt": 50000,
+  "max_basis_pct": 0.004,
+  "funding_avoid_window_sec": 300
+}
+```
+
+Global: `account_daily_loss_limit_usdt`, `min_margin_ratio`, `order_budget_per_min: 900`, `weight_budget_per_min: 1800`, `position_mode: "hedge"` (bắt buộc khớp sàn lúc startup).
+
+---
+
+## 6. Cơ chế an toàn cấu trúc
+
+### 6.1 Chống desync (triệt để)
+Private WS = truth cho fill; reconcile REST 60s (`fetchOpenOrders` + `fetchPositions` — parse **cả 2 positionSide**); startup/reconnect: reconcile xong mới cho quote; SL server-side bảo vệ cả khi bot down; time sync định kỳ.
+
+### 6.2 Kill-All (Hedge Mode) — 6 phase
+1. Stop toàn bộ worker (flag in-memory, ngừng quote ngay).
+2. `cancel_all_orders` từng symbol (gồm cả TP/SL của executor).
+3. **Fetch positions THẬT**, lọc `positionAmt ≠ 0` theo từng `positionSide`.
+4. Với mỗi (symbol, side): MARKET ngược chiều + `positionSide` + qty = `|positionAmt|`. Không dùng `reduceOnly`/`closePosition`.
+5. **Re-fetch xác nhận về 0**; nếu còn dư (do fill chen giữa) → đóng bổ sung 1 lần nữa.
+6. Report per-pair/side trên dashboard; fail → alert đỏ + Telegram.
+
+### 6.3 Account circuit breaker
+`account_daily_loss_limit_usdt` chạm → kill-all + khóa start; `min_margin_ratio`: cảnh báo 150% maintenance, kill-all 120%. Lưu ý Hedge mode ôm 2 phía → margin guard tính trên **gross**.
+
+---
+
+## 7. Cấu trúc thư mục
+
+```
+open_pmm_project/
+├── app/
+│   ├── config.py                  # env, API keys, global limits, position_mode=hedge
+│   ├── main.py                    # FastAPI + NiceGUI chung process
+│   ├── core/
+│   │   ├── gateway.py             # ccxt.pro + WS + positionSide(dual) verify/set
+│   │   ├── ratelimit.py           # token bucket ORDERS + WEIGHT, jitter
+│   │   ├── market_state.py        # smoothed mid, vol, mark check
+│   │   ├── quoter.py              # levels, per-side skew, clamp_quote()
+│   │   ├── executor.py            # TripleBarrierExecutor (per positionSide,
+│   │   │                          #  bao gồm SL qty sync sau partial TP)
+│   │   ├── position_tracker.py    # 2 slots LONG/SHORT, fill-driven + reconcile
+│   │   ├── worker.py              # PMMWorker
+│   │   ├── manager.py             # BotManager, cô lập lỗi, kill-all 6-phase
+│   │   └── circuit_breaker.py
+│   ├── models/
+│   │   ├── config.py
+│   │   └── state.py               # Fill, SidePosition, ExecutorState, PnLRecord
+│   ├── persistence/
+│   │   ├── db.py                  # SQLite WAL: fills, orders, pnl, config audit
+│   │   └── store.py
+│   ├── api/
+│   │   ├── router.py              # bots CRUD, start/stop/pause, fills, pnl, kill-all
+│   │   └── events.py              # in-process bus → NiceGUI
+│   └── ui/
+│       ├── dashboard.py           # pair card hiển thị 2 slot LONG/SHORT
+│       └── components/
+├── config/
+│   ├── pairs/*.json
+│   └── global.json
+├── tests/
+│   ├── test_quoter.py             # clamp, per-side skew, floor
+│   ├── test_executor_hedge.py     # ★ barrier từng side + SL qty sync sau partial TP
+│   ├── test_requote.py
+│   ├── test_reconcile_hedge.py    # 2 positionSide, startup recovery
+│   ├── test_kill_all_hedge.py     # 6-phase, không reduceOnly, re-fetch confirm
+│   └── test_position_mode.py      # abort khi sàn không ở Hedge
+├── scripts/shadow_run.py
+├── Dockerfile, docker-compose.yml, requirements.txt, README.md
+```
+
+---
+
+## 8. Lộ trình 6 giai đoạn
+
+| Phase | Nội dung | Tiêu chí nghiệm thu |
+|-------|----------|---------------------|
+| **0 — Spike & Shadow (3–5 ngày)** | Verify ccxt.pro: private WS futures, amend/batch, GTX rejection, **STOP_MARKET + positionSide trong Hedge mode**, Bybit idx mapping. Shadow mode live-data không lệnh thật | Capability matrix 2 sàn; shadow 24h không crash; 100% fill hypothetical map đúng side |
+| **1 — Worker + Hedge State Sync (1–2 tuần)** | Gateway + Hedge verifier, PositionTracker 2 slots + reconcile, Quoter 1 level + per-side skew, Executor triple barrier **kèm SL qty sync**, startup recovery. Testnet → 1 cặp mainnet size nhỏ | Pull-plug khi đang ôm cả LONG lẫn SHORT → restart khôi phục đúng 100% cả 2 side, SL server-side còn nguyên trên sàn; desync = 0 sau 72h |
+| **2 — Multi-pair + Rate Limit + Filters (1 tuần)** | BotManager 20–30 task, token bucket, event requote + amend/batch, vol filter, funding window, circuit breaker (gross-aware) | 30 cặp 24h: < 75% order budget, không 418/429; kill WS 1 cặp → 29 cặp vô ảnh |
+| **3 — Feature parity (1 tuần)** | Order levels, ping-pong per-side, hanging, ceiling/floor, TP levels, trailing, cooldown per-side | Replay cùng market data: quote lệch HB < 1 tick; mọi barrier kích hoạt đúng side, đúng qty |
+| **4 — FastAPI + NiceGUI (1 tuần)** | REST, hot-reload + audit, grid cards 2-slot, kill-all, PnL attribution per side, Telegram | Hot-reload < 1 chu kỳ; kill-all 30 cặp × 2 side < 15s, confirm = 0; UI không block event loop |
+| **5 — Hardening & Backtest (liên tục)** | SIGTERM graceful, WS watchdog, PnL report, backtest replay, chaos drill hàng tuần | Chaos: ngắt WS 5 phút, partial TP liên tiếp, restart giữa chu kỳ → SL qty luôn đúng, không lật vị thế |
+
+---
+
+## 9. Agent Guardrails (v3)
+
+1. **Post-Only tuyệt đối** cho mọi quote; ngoại lệ duy nhất: exit MARKET của SL/trailing/time-limit/kill-all — tất cả phải kèm đúng `positionSide`.
+2. **Hedge Mode contract:** mọi order struct bắt buộc có trường `positionSide`; code review reject mọi order thiếu trường này. Cấm `reduceOnly` và `closePosition` trong toàn bộ codebase (Binance từ chối trong Hedge mode).
+3. **SL qty invariant:** với mọi side position, `sl_order.qty == side_position.qty` phải đúng sau MỌI sự kiện fill. Có assertion runtime + reconcile tự sửa.
+4. **Futures-only:** symbol chuẩn `BASE/USDT:USDT`; bắt buộc `set_leverage` + `set_margin_mode` + verify Hedge mode trước khi enable worker; abort nếu không chuyển được mode.
+5. **Cô lập lỗi** theo pair; exception không propagate crash manager.
+6. **State từ sàn:** mọi quyết định vị thế dựa trên dữ liệu reconcile; local chỉ là cache.
+7. **Rate limit:** mọi request qua GlobalRateLimiter, kể cả kill-all (có hàng ưu tiên nhưng không vượt ngưỡng IP ban).
+8. **Shadow trước:** config/exchange/feature mới → shadow ≥ 24h trước khi chạy API key thật.
+9. **Không âm spread:** mọi tính giá qua `clamp_quote()`; test bắt buộc cho ρ cực trị.

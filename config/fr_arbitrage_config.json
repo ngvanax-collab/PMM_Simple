@@ -1,0 +1,9 @@
+{
+  "max_leverage": 5,
+  "allocated_margin_per_pair": 200.0,
+  "min_expected_edge_bps": 15.0,
+  "max_loss_usd": 50.0,
+  "decision_layer_url": "http://localhost:8102",
+  "poll_interval_sec": 10.0,
+  "auto_execution_enabled": false
+}

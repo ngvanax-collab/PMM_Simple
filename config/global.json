@@ -1,0 +1,10 @@
+{
+  "account_daily_loss_limit_usdt": 100.0,
+  "min_margin_ratio": 1.5,
+  "kill_margin_ratio": 1.2,
+  "order_budget_per_min": 900,
+  "weight_budget_per_min": 1800,
+  "position_mode": "hedge",
+  "testnet": false,
+  "reconcile_interval_sec": 60
+}

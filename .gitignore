@@ -1,0 +1,21 @@
+# API keys & Credentials
+.env
+*.env
+*credentials*
+config/credentials.json
+
+# Database & Logs
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+
+# Python cache & Virtual environment
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
