@@ -113,13 +113,23 @@ class PairConfig(BaseModel):
 
     # ── Risk & Volatility Filters ──
     max_loss_usdt: float = Field(default=15.0, gt=0, description="Max single position loss threshold")
-    daily_loss_limit_usdt: float = Field(default=30.0, gt=0, description="Max cumulative daily loss for this pair")
+    daily_loss_limit_usdt: float = Field(
+        default=30.0, gt=0,
+        validation_alias=AliasChoices("daily_loss_limit_usdt", "max_daily_loss_usdt"),
+        description="Max cumulative daily loss for this pair"
+    )
+    reconcile_interval_sec: int = Field(default=60, ge=10, description="Periodic REST reconcile interval in seconds")
     vol_pause_pct: float = Field(default=0.025, gt=0, description="Pause quoting if price moves > % in lookback window")
     vol_lookback_sec: int = Field(default=60, ge=10, description="Lookback window for volatility calculation")
     max_book_spread_pct: float = Field(default=0.005, gt=0, description="Pause quoting if orderbook spread exceeds %")
     min_depth_usdt: float = Field(default=50000.0, ge=0, description="Min depth in USDT within 1% of mid")
     max_basis_pct: float = Field(default=0.004, gt=0, description="Max allowed basis |mid - mark| / mark")
     funding_avoid_window_sec: int = Field(default=300, ge=0, description="Seconds around funding time to reduce inventory or pause")
+
+    @property
+    def max_daily_loss_usdt(self) -> float:
+        """Alias for daily_loss_limit_usdt."""
+        return self.daily_loss_limit_usdt
 
     @field_validator("margin_mode")
     @classmethod

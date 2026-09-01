@@ -288,21 +288,24 @@ class Database:
                 logger.warning(f"Failed to record PnL for {record.symbol}: {e}")
                 return 0
 
-    async def get_pnl_summary(self, since_timestamp: float = 0.0) -> Dict[str, float]:
+    async def get_pnl_summary(self, since_timestamp: float = 0.0, symbol: Optional[str] = None) -> Dict[str, float]:
         """Calculate total realized PnL, total fees, and net PnL from fills table."""
         if self._conn is None:
             return {"total_realized_pnl": 0.0, "total_fee": 0.0, "total_net_pnl": 0.0}
 
-        async with self._conn.execute(
-            """
+        query = """
             SELECT
                 COALESCE(SUM(realized_pnl), 0.0) as total_realized_pnl,
                 COALESCE(SUM(fee), 0.0) as total_fee
             FROM fills
             WHERE timestamp >= ?
-            """,
-            (since_timestamp,)
-        ) as cursor:
+        """
+        params: List[Any] = [since_timestamp]
+        if symbol:
+            query += " AND symbol = ?"
+            params.append(symbol)
+
+        async with self._conn.execute(query, tuple(params)) as cursor:
             row = await cursor.fetchone()
             if row:
                 tot_pnl = float(row["total_realized_pnl"])

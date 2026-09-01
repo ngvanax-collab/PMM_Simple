@@ -86,7 +86,7 @@ class PMMQuoter:
         spread_floor: float,
         best_bid: Optional[float] = None,
         best_ask: Optional[float] = None,
-    ) -> float:
+    ) -> Optional[float]:
         """
         Enforce strict safety rules on quote prices:
         1. Bid is floored, Ask is ceiled to tick size.
@@ -110,6 +110,13 @@ class PMMQuoter:
             if best_bid is not None and best_bid > 0:
                 max_allowed_bid = min(max_allowed_bid, self.quantize_price(best_bid, is_bid=True))
 
+            if self.config.price_floor > 0 and self.config.price_floor > max_allowed_bid:
+                logger.warning(
+                    f"[QUOTER_WARNING] price_floor ({self.config.price_floor}) > max_allowed_bid ({max_allowed_bid}) "
+                    f"for {self.config.symbol}. Clamping to max_allowed_bid and skipping quote."
+                )
+                return None
+
             clamped = min(quantized, max_allowed_bid)
             if self.config.price_floor > 0:
                 # price_floor must not breach max_allowed_bid
@@ -124,6 +131,13 @@ class PMMQuoter:
                 min_allowed_ask = max(min_allowed_ask, self.quantize_price(best_bid + self.tick_size, is_bid=False))
             if best_ask is not None and best_ask > 0:
                 min_allowed_ask = max(min_allowed_ask, self.quantize_price(best_ask, is_bid=False))
+
+            if self.config.price_ceiling > 0 and self.config.price_ceiling < min_allowed_ask:
+                logger.warning(
+                    f"[QUOTER_WARNING] price_ceiling ({self.config.price_ceiling}) < min_allowed_ask ({min_allowed_ask}) "
+                    f"for {self.config.symbol}. Clamping to min_allowed_ask and skipping quote."
+                )
+                return None
 
             clamped = max(quantized, min_allowed_ask)
             if self.config.price_ceiling > 0:
@@ -274,7 +288,7 @@ class PMMQuoter:
                     best_ask=best_ask,
                 )
 
-                if bid_price <= 0:
+                if bid_price is None or bid_price <= 0:
                     continue
 
                 amount_usdt = self.config.order_amount_usdt + i * self.config.order_level_amount
@@ -374,7 +388,7 @@ class PMMQuoter:
                     best_ask=best_ask,
                 )
 
-                if ask_price <= 0:
+                if ask_price is None or ask_price <= 0:
                     continue
 
                 amount_usdt = self.config.order_amount_usdt + i * self.config.order_level_amount

@@ -188,6 +188,50 @@ async def test_dynamic_trailing_tp_short_activation_and_pullback(setup_trailing_
 
 
 @pytest.mark.asyncio
+async def test_dynamic_trailing_tp_short_trough_price_init_inf(setup_trailing_env):
+    """
+    Verify that when trough_price starts at float('inf'),
+    Trailing TP for SHORT properly tracks the descending price and bounces to exit.
+    """
+    _, executor_short, tracker, _, mock_gateway, _ = setup_trailing_env
+
+    entry_fill = FillRecord(
+        id="fill_s2",
+        order_id="ord_s2",
+        symbol="SOL/USDT:USDT",
+        side=OrderSide.SELL,
+        position_side=PositionSide.SHORT,
+        price=100.0,
+        amount=10.0,
+        quote_amount=1000.0,
+        fee=0.2,
+        is_maker=True,
+        timestamp=time.time(),
+    )
+    await tracker.on_fill(entry_fill)
+    await executor_short.on_entry_fill(entry_fill)
+    assert executor_short.state.trough_price == float('inf')
+
+    # Force activate trailing TP with initial trough_price = float('inf')
+    executor_short.state.trailing_tp_active = True
+    executor_short.state.trough_price = float('inf')
+
+    # Price moves to 98.0 -> trough_price must become 98.0
+    await executor_short.check_runtime_barriers(current_price=98.0)
+    assert executor_short.state.trough_price == 98.0
+
+    # Price moves further down to 97.5 -> trough_price updates to 97.5
+    await executor_short.check_runtime_barriers(current_price=97.5)
+    assert executor_short.state.trough_price == 97.5
+
+    # Price bounces to 97.9 (> 97.5 * 1.003 = 97.7925) -> Trigger market exit
+    mock_gateway.create_exit_order.reset_mock()
+    await executor_short.check_runtime_barriers(current_price=97.9)
+    assert mock_gateway.create_exit_order.call_count == 1
+    assert mock_gateway.create_exit_order.call_args.kwargs["purpose"] == OrderPurpose.TRAILING_TAKE_PROFIT
+
+
+@pytest.mark.asyncio
 async def test_independent_side_cooldown_and_quoting_isolation(setup_trailing_env):
     """
     CRITICAL OBJECTIVE 5 TEST:

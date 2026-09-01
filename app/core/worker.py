@@ -78,6 +78,23 @@ class PMMWorker:
         self.is_locked_killed: bool = bool(self.config.is_locked)
         self.is_draining: bool = False
 
+    @staticmethod
+    def _handle_task_exception(task: asyncio.Task) -> None:
+        """Callback to capture and log unhandled background task exceptions."""
+        try:
+            if not task.cancelled():
+                exc = task.exception()
+                if exc:
+                    logger.error(f"[BACKGROUND_TASK_ERROR] Background task raised unhandled exception: {exc}")
+        except Exception as e:
+            logger.error(f"[BACKGROUND_TASK_ERROR] Error retrieving task exception: {e}")
+
+    def _create_background_task(self, coro) -> asyncio.Task:
+        """Create and track background task with error logging callback."""
+        task = asyncio.create_task(coro)
+        task.add_done_callback(self._handle_task_exception)
+        return task
+
     @property
     def is_running(self) -> bool:
         return self._running
@@ -102,7 +119,7 @@ class PMMWorker:
         self.is_draining = draining
         if draining:
             logger.info(f"[{self.symbol}] Worker entered GRACEFUL DRAINING mode. Halting new entries.")
-            asyncio.create_task(self._cancel_active_quotes())
+            self._create_background_task(self._cancel_active_quotes())
         else:
             logger.info(f"[{self.symbol}] Worker exited DRAINING mode.")
 
@@ -149,14 +166,14 @@ class PMMWorker:
 
         # Launch public WS ticker stream for realtime top-of-book updates
         if hasattr(self.gateway, "watch_public_ticker"):
-            self._ws_ticker_task = asyncio.create_task(
+            self._ws_ticker_task = self._create_background_task(
                 self.gateway.watch_public_ticker(
                     self.symbol,
-                    lambda bid, ask, mark: asyncio.create_task(self.on_ticker_update(bid, ask, mark))
+                    lambda bid, ask, mark: self._create_background_task(self.on_ticker_update(bid, ask, mark))
                 )
             )
 
-        self._loop_task = asyncio.create_task(self._main_worker_loop())
+        self._loop_task = self._create_background_task(self._main_worker_loop())
 
     async def stop(self) -> None:
         """Stop worker and cancel all open quote orders."""
@@ -324,7 +341,7 @@ class PMMWorker:
                     f"[{self.symbol}][CIRCUIT_BREAKER_RESUMED] Volatility subsided (delta={delta_60s*100:.2f}% < threshold={threshold*100:.2f}%). "
                     f"Resuming normal quoting."
                 )
-                asyncio.create_task(self._requote())
+                self._create_background_task(self._requote())
 
     # ── Event Callbacks ──
 
@@ -348,14 +365,42 @@ class PMMWorker:
         if fill.symbol != self.symbol:
             return
 
-        # Defensive normalization: extract position_side from client_order_id if present
         cid = str(fill.client_order_id or "").lower()
-        if "short" in cid or "q_sell" in cid:
-            fill.position_side = PositionSide.SHORT
-        elif "long" in cid or "q_buy" in cid:
-            fill.position_side = PositionSide.LONG
 
-        logger.info(f"[{self.symbol}] Fill event received: {fill.side.value} {fill.position_side.value} {fill.amount:.4f} @ {fill.price:.2f}")
+        # 1. Routing classification based on standardized client_order_id prefixes
+        if cid.startswith("q_buy_"):
+            fill.position_side = PositionSide.LONG
+            is_entry = True
+        elif cid.startswith("q_sell_"):
+            fill.position_side = PositionSide.SHORT
+            is_entry = True
+        elif cid.startswith(("tp_long", "sl_long", "pe_long", "pexit_long", "kill_long")):
+            fill.position_side = PositionSide.LONG
+            is_entry = False
+        elif cid.startswith(("tp_short", "sl_short", "pe_short", "pexit_short", "kill_short")):
+            fill.position_side = PositionSide.SHORT
+            is_entry = False
+        elif cid.startswith(("tp_", "sl_", "pe_", "pexit_", "exit_", "kill_")):
+            if "short" in cid:
+                fill.position_side = PositionSide.SHORT
+            elif "long" in cid:
+                fill.position_side = PositionSide.LONG
+            is_entry = False
+        else:
+            if "short" in cid or "q_sell" in cid:
+                fill.position_side = PositionSide.SHORT
+            elif "long" in cid or "q_buy" in cid:
+                fill.position_side = PositionSide.LONG
+
+            is_entry = (
+                (fill.position_side == PositionSide.LONG and fill.side == OrderSide.BUY) or
+                (fill.position_side == PositionSide.SHORT and fill.side == OrderSide.SELL)
+            )
+
+        logger.info(
+            f"[{self.symbol}] Fill event received: {fill.side.value} {fill.position_side.value} "
+            f"{fill.amount:.4f} @ {fill.price:.2f} (cid={fill.client_order_id}, is_entry={is_entry})"
+        )
 
         # Update position tracker
         await self.tracker.on_fill(fill)
@@ -364,22 +409,20 @@ class PMMWorker:
         except Exception as e:
             logger.warning(f"[{self.symbol}] Non-fatal DB save_fill error: {e}")
 
-        # Route to appropriate executor
-        is_long_entry = (fill.position_side == PositionSide.LONG and fill.side == OrderSide.BUY)
-        is_short_entry = (fill.position_side == PositionSide.SHORT and fill.side == OrderSide.SELL)
-
-        if is_long_entry:
-            await self.executor_long.on_entry_fill(fill)
-        elif fill.position_side == PositionSide.LONG:
-            await self.executor_long.on_exit_fill(fill)
-
-        if is_short_entry:
-            await self.executor_short.on_entry_fill(fill)
-        elif fill.position_side == PositionSide.SHORT:
-            await self.executor_short.on_exit_fill(fill)
+        # Strict routing to executor
+        if is_entry:
+            if fill.position_side == PositionSide.LONG:
+                await self.executor_long.on_entry_fill(fill)
+            else:
+                await self.executor_short.on_entry_fill(fill)
+        else:
+            if fill.position_side == PositionSide.LONG:
+                await self.executor_long.on_exit_fill(fill)
+            else:
+                await self.executor_short.on_exit_fill(fill)
 
         # Update session realized PnL on exit fills
-        if not (is_long_entry or is_short_entry):
+        if not is_entry:
             net_fill_pnl = fill.realized_pnl - fill.fee
             self.session_realized_pnl += net_fill_pnl
             logger.info(
@@ -389,7 +432,7 @@ class PMMWorker:
 
         # Trigger immediate requote after fill if not killed and not draining
         if not (self.config.is_locked or self.is_locked_killed or self.is_draining):
-            asyncio.create_task(self._requote())
+            self._create_background_task(self._requote())
 
     async def on_order_update(self, order: OrderRecord) -> None:
         """Handle order status update."""
@@ -429,9 +472,10 @@ class PMMWorker:
                     await asyncio.sleep(1.0)
                     continue
 
-                # 2. Periodic 60s REST Reconcile
+                # 2. Periodic Reconciliation Heartbeat
                 now = time.time()
-                if now - last_reconcile >= self.config.order_refresh_time or now - last_reconcile >= 60:
+                reconcile_interval = getattr(self.config, "reconcile_interval_sec", 60)
+                if now - last_reconcile >= reconcile_interval:
                     await self.tracker.reconcile_with_exchange()
                     await self.reconcile_barriers()
                     last_reconcile = now

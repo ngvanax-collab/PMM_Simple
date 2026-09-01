@@ -608,8 +608,25 @@ class QuantitativeScreener:
                                 )
                                 return None
 
-                            # Depth estimation from volume activity
+                            # Depth calculation from real orderbook snapshot or fallback to volume estimation
                             depth_1pct = max(50_000.0, min(500_000.0, vol_24h * 0.001))
+                            if hasattr(gateway._exchange, "fetch_order_book") and price > 0:
+                                try:
+                                    ob = await gateway._exchange.fetch_order_book(sym, limit=20)
+                                    bids = ob.get("bids") or []
+                                    asks = ob.get("asks") or []
+                                    min_bid = price * 0.99
+                                    max_ask = price * 1.01
+                                    b_depth = sum(float(p) * float(q) for p, q in bids if float(p) >= min_bid)
+                                    a_depth = sum(float(p) * float(q) for p, q in asks if float(p) <= max_ask)
+                                    real_depth = b_depth + a_depth
+                                    if real_depth > 0:
+                                        depth_1pct = float(real_depth)
+                                except Exception as e:
+                                    logger.warning(
+                                        f"[SCREENER_WARNING] Failed to fetch orderbook depth for {sym}: {e}. "
+                                        f"Falling back to volume estimation."
+                                    )
 
                             # Compute Composite Score for qualified candidates
                             score, s_mr, s_natr, s_liq, s_fr = compute_pmm_composite_score(
@@ -648,7 +665,9 @@ class QuantitativeScreener:
                 gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
                 for item in gathered:
-                    if isinstance(item, MarketMetric) and item.status != "FILTERED":
+                    if isinstance(item, Exception):
+                        logger.error(f"[SCREENER_TASK_ERROR] {item}")
+                    elif isinstance(item, MarketMetric) and item.status != "FILTERED":
                         results.append(item)
 
                 # 4. Sort descending by PMM score and assign ranks

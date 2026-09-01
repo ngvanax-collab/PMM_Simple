@@ -195,8 +195,7 @@ class TripleBarrierExecutor:
         Updates remaining position size, records PnL, and manages progressive cooldown.
         """
         async with self._lock:
-            pos_state = self.tracker.get_state(self.position_side)
-            self.state.remaining_qty = pos_state.amount
+            self.state.remaining_qty = max(0.0, self.state.remaining_qty - fill.amount)
             self.state.last_update_time = time.time()
             self.state.sl_qty = self.quoter.quantize_amount(self.state.remaining_qty)
 
@@ -223,7 +222,7 @@ class TripleBarrierExecutor:
             )
             is_passive_exit_fill = (
                 self.state.passive_exit_order_id is not None and fill.order_id == self.state.passive_exit_order_id
-            ) or "pexit_" in cl_id
+            ) or "pe_" in cl_id or "pexit_" in cl_id
 
             if is_passive_exit_fill:
                 logger.info(
@@ -255,10 +254,12 @@ class TripleBarrierExecutor:
                 self.state.passive_exit_start_time = 0.0
                 return
 
-            # Partial exit
+            # Partial exit: Re-place TP orders for remaining quantity to protect position
             logger.info(
-                f"[{self.symbol}][{self.position_side.value}] Partial exit fill: remaining={self.state.remaining_qty:.4f}."
+                f"[{self.symbol}][{self.position_side.value}] Partial exit fill: remaining={self.state.remaining_qty:.4f}. Re-placing TP orders."
             )
+            if self.state.active and not self._is_exiting:
+                await self._place_take_profit_orders()
 
     async def _place_take_profit_orders(self) -> None:
         """Place multi-level Take Profit orders with inventory skew boost."""
@@ -409,7 +410,7 @@ class TripleBarrierExecutor:
                         )
 
                     if self.state.trailing_tp_active:
-                        if self.state.trough_price <= 0 or current_price < self.state.trough_price:
+                        if self.state.trough_price == float('inf') or self.state.trough_price <= 0 or current_price < self.state.trough_price:
                             self.state.trough_price = current_price
                         trail_tp_trigger = self.state.trough_price * (1.0 + cb_pct)
                         if current_price >= trail_tp_trigger:
@@ -513,7 +514,7 @@ class TripleBarrierExecutor:
             target_p = min(self.state.entry_price * (1.0 - offset_pct), best_bid if best_bid > 0 else current_price)
             exit_price = self.quoter.quantize_price(target_p, is_bid=True)
 
-        client_id = f"pexit_{self.position_side.value.lower()}_{int(now*1000)}"
+        client_id = f"pe_{self.position_side.value.lower()}_{int(now*1000)}"
         resp = await self.gateway.create_exit_order(
             symbol=self.symbol,
             side=self.exit_side,
@@ -552,7 +553,13 @@ class TripleBarrierExecutor:
         # Cancel TP, SL, and Passive exit orders
         await self._cleanup_all_barrier_orders()
 
-        client_id = f"exit_{purpose.value.lower()}_{int(time.time()*1000)}"
+        if purpose == OrderPurpose.STOP_LOSS:
+            client_id = f"sl_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+        elif purpose in (OrderPurpose.TAKE_PROFIT, OrderPurpose.TRAILING_TAKE_PROFIT):
+            client_id = f"tp_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+        else:
+            client_id = f"exit_{purpose.value.lower()}_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+
         resp = await self.gateway.create_exit_order(
             symbol=self.symbol,
             side=self.exit_side,

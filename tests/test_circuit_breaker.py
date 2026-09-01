@@ -4,11 +4,8 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from app.core.circuit_breaker import CircuitBreaker
-from app.models.config import GlobalConfig
+from app.models.config import GlobalConfig, PairConfig
 from app.persistence.db import db
-
-
-
 
 
 @pytest.mark.asyncio
@@ -79,3 +76,37 @@ async def test_circuit_breaker_manual_reset_clears_tripped_state():
     assert cb.is_tripped is False
     assert cb.trip_reason == ""
     assert cb._reset_timestamp > 0
+
+
+@pytest.mark.asyncio
+async def test_check_pair_loss_healthy():
+    """Verify check_pair_loss returns healthy when pair PnL is within daily limit."""
+    global_cfg = GlobalConfig()
+    cb = CircuitBreaker(global_cfg)
+    pair_cfg = PairConfig(symbol="SOL/USDT:USDT", daily_loss_limit_usdt=30.0)
+
+    with patch("app.persistence.db.db.get_pnl_summary", new_callable=AsyncMock) as mock_pnl:
+        mock_pnl.return_value = {"total_realized_pnl": -10.0, "total_fee": 1.0, "total_net_pnl": -11.0}
+
+        tripped, reason = await cb.check_pair_loss(pair_cfg)
+        assert tripped is False
+        assert reason == "OK"
+        mock_pnl.assert_awaited_once()
+        assert mock_pnl.call_args.kwargs["symbol"] == "SOL/USDT:USDT"
+
+
+@pytest.mark.asyncio
+async def test_check_pair_loss_trips_on_excessive_loss():
+    """Verify check_pair_loss trips when pair net loss exceeds daily_loss_limit_usdt / max_daily_loss_usdt."""
+    global_cfg = GlobalConfig()
+    cb = CircuitBreaker(global_cfg)
+    pair_cfg = PairConfig(symbol="ETH/USDT:USDT", daily_loss_limit_usdt=30.0)
+
+    with patch("app.persistence.db.db.get_pnl_summary", new_callable=AsyncMock) as mock_pnl:
+        mock_pnl.return_value = {"total_realized_pnl": -32.0, "total_fee": 1.0, "total_net_pnl": -33.0}
+
+        tripped, reason = await cb.check_pair_loss(pair_cfg)
+        assert tripped is True
+        assert "Pair ETH/USDT:USDT daily loss limit exceeded: -33.00 USDT >= 30.00 USDT" in reason
+        mock_pnl.assert_awaited_once()
+        assert mock_pnl.call_args.kwargs["symbol"] == "ETH/USDT:USDT"

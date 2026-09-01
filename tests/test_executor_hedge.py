@@ -125,10 +125,14 @@ async def test_sl_quantity_sync_on_partial_tp(setup_executor):
     await tracker.on_fill(tp_fill)
     await executor.on_exit_fill(tp_fill)
 
-    # 3. VERIFY SL INVARIANT: Remaining qty is 5.0 and Virtual SL quantity MUST be 5.0!
+    # 3. VERIFY SL INVARIANT & TP RE-PLACEMENT:
+    # Remaining qty is 5.0, Virtual SL quantity MUST be 5.0, and TP orders re-placed for 5.0!
     assert tracker.long_pos.amount == 5.0
     assert executor.state.remaining_qty == 5.0
     assert executor.state.sl_qty == 5.0, f"Expected SL qty=5.0 after partial TP, but got {executor.state.sl_qty}"
+    assert executor.state.active is True
+    assert len(executor.state.tp_orders) == 2
+    assert sum(tp["qty"] for tp in executor.state.tp_orders) == pytest.approx(5.0)
 
 
 @pytest.mark.asyncio

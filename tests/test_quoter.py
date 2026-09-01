@@ -147,3 +147,29 @@ def test_clamp_quote_with_best_bid_ask(quoter):
     )
     assert ask_clamped >= best_ask
     assert ask_clamped >= (best_bid + quoter.tick_size)
+
+
+def test_clamp_quote_price_floor_breach(quoter):
+    """Verify that when price_floor > max_allowed_bid, clamp_quote returns None and quote is skipped."""
+    mid_price = 100.0
+    spread_floor = quoter.calculate_spread_floor(mid_price)
+
+    # Set price_floor higher than mid_price (e.g. 101.0 > 100.0)
+    quoter.config.price_floor = 101.0
+
+    bid_clamped = quoter.clamp_quote(
+        raw_price=99.5,
+        is_bid=True,
+        mid_price=mid_price,
+        spread_floor=spread_floor,
+    )
+    assert bid_clamped is None, "Expected None when price_floor > max_allowed_bid"
+
+    # Verify calculate_quotes skips bids when price_floor breaches
+    bids, asks = quoter.calculate_quotes(
+        smoothed_mid=mid_price,
+        long_value_usdt=0.0,
+        short_value_usdt=0.0,
+    )
+    assert len(bids) == 0, "Bids should be empty when price_floor breaches max_allowed_bid"
+    assert len(asks) > 0, "Asks should still be calculated normally"

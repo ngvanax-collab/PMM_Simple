@@ -89,5 +89,14 @@ class CircuitBreaker:
         now = time.time()
         start_of_day = now - (now % 86400)
         since_ts = max(start_of_day, self._reset_timestamp)
-        pnl_summary = await db.get_pnl_summary(since_timestamp=since_ts)
+        pnl_summary = await db.get_pnl_summary(symbol=config.symbol, since_timestamp=since_ts)
+        
+        realized_pnl = pnl_summary.get("total_net_pnl", pnl_summary.get("total_realized_pnl", 0.0))
+        max_daily_loss = getattr(config, "max_daily_loss_usdt", getattr(config, "daily_loss_limit_usdt", getattr(config, "max_loss_usdt", 0.0)))
+
+        if max_daily_loss > 0 and realized_pnl < 0 and abs(realized_pnl) >= max_daily_loss:
+            reason = f"Pair {config.symbol} daily loss limit exceeded: {realized_pnl:.2f} USDT >= {max_daily_loss:.2f} USDT"
+            logger.critical(f"PAIR CIRCUIT BREAKER TRIPPED! {reason}")
+            return True, reason
+
         return False, "OK"

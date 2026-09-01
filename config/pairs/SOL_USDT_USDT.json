@@ -1,7 +1,7 @@
 {
   "symbol": "SOL/USDT:USDT",
   "exchange": "binance",
-  "enabled": false,
+  "enabled": true,
   "leverage": 5,
   "margin_mode": "isolated",
   "order_amount_usdt": 50.0,
@@ -67,6 +67,7 @@
   "circuit_breaker_pause_sec": 60,
   "max_loss_usdt": 15.0,
   "daily_loss_limit_usdt": 30.0,
+  "reconcile_interval_sec": 60,
   "vol_pause_pct": 0.025,
   "vol_lookback_sec": 60,
   "max_book_spread_pct": 0.005,
