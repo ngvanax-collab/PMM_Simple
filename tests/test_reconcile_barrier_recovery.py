@@ -202,40 +202,42 @@ async def test_startup_reconcile_overflow_tp_breached(setup_test_env):
 async def test_worker_reconcile_barriers_integration():
     """Test full PMMWorker reconcile_barriers method."""
     await db.connect()
+    try:
+        config = PairConfig(
+            symbol="SOL/USDT:USDT",
+            tp_levels=[[0.01, 1.0]],
+            stop_loss=0.02,
+        )
+        mock_gw = MagicMock()
+        mock_gw.get_market_precision.return_value = (2, 3, 0.01, 0.001)
+        mock_gw.create_exit_order = AsyncMock(return_value={"id": "mock_exit_1"})
+        mock_gw.cancel_order = AsyncMock(return_value=True)
 
-    config = PairConfig(
-        symbol="SOL/USDT:USDT",
-        tp_levels=[[0.01, 1.0]],
-        stop_loss=0.02,
-    )
-    mock_gw = MagicMock()
-    mock_gw.get_market_precision.return_value = (2, 3, 0.01, 0.001)
-    mock_gw.create_exit_order = AsyncMock(return_value={"id": "mock_exit_1"})
-    mock_gw.cancel_order = AsyncMock(return_value=True)
+        real_long = SidePositionState(
+            symbol="SOL/USDT:USDT",
+            position_side=PositionSide.LONG,
+            amount=5.0,
+            entry_price=100.0,
+            current_price=100.2,
+        )
+        real_short = SidePositionState(
+            symbol="SOL/USDT:USDT",
+            position_side=PositionSide.SHORT,
+            amount=0.0,
+            entry_price=0.0,
+            current_price=100.2,
+        )
+        mock_gw.fetch_positions_hedge = AsyncMock(return_value=(real_long, real_short))
 
-    real_long = SidePositionState(
-        symbol="SOL/USDT:USDT",
-        position_side=PositionSide.LONG,
-        amount=5.0,
-        entry_price=100.0,
-        current_price=100.2,
-    )
-    real_short = SidePositionState(
-        symbol="SOL/USDT:USDT",
-        position_side=PositionSide.SHORT,
-        amount=0.0,
-        entry_price=0.0,
-        current_price=100.2,
-    )
-    mock_gw.fetch_positions_hedge = AsyncMock(return_value=(real_long, real_short))
+        worker = PMMWorker(config, mock_gw)
+        await worker.tracker.reconcile_with_exchange()
+        worker.market_state.update_ticker(100.1, 100.3, 100.2)
 
-    worker = PMMWorker(config, mock_gw)
-    await worker.tracker.reconcile_with_exchange()
-    worker.market_state.update_ticker(100.1, 100.3, 100.2)
+        await worker.reconcile_barriers()
 
-    await worker.reconcile_barriers()
-
-    assert worker.executor_long.state.active is True
-    assert worker.executor_long.state.remaining_qty == 5.0
-    assert worker.executor_short.state.active is False
+        assert worker.executor_long.state.active is True
+        assert worker.executor_long.state.remaining_qty == 5.0
+        assert worker.executor_short.state.active is False
+    finally:
+        await db.close()
 

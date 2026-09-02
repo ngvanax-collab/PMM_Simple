@@ -203,7 +203,11 @@ async def test_circuit_breaker_cancels_entries_preserves_tp_sl():
         realized_pnl=0.0,
     )
     now = 1000.0
-    with patch("app.core.worker.db.save_fill", new_callable=AsyncMock):
+    with patch("app.core.worker.db.save_fill", new_callable=AsyncMock), \
+         patch("app.core.worker.db.record_pnl", new_callable=AsyncMock), \
+         patch("app.core.worker.db.save_order", new_callable=AsyncMock), \
+         patch("app.core.executor.db.record_pnl", new_callable=AsyncMock), \
+         patch("app.core.executor.db.save_fill", new_callable=AsyncMock):
         await worker.on_fill(entry_fill)
         worker.executor_long.state.entry_timestamp = time.time() - 30.0  # past min_holding_sec
 

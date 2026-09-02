@@ -24,55 +24,56 @@ async def setup_executor():
     test_db = Database(temp_path)
     await test_db.connect()
 
-    with patch("app.core.executor.db", test_db):
-        config = PairConfig(
-            symbol="SOL/USDT:USDT",
-            tp_levels=[[0.01, 0.5], [0.02, 0.5]],  # 50% at 1% TP, 50% at 2% TP
-            stop_loss=0.02,  # 2% SL
-            time_limit=3600,
-            trailing_tp_enabled=False,  # Test legacy trailing stop config independently
-            trailing_stop={"activation_price": 0.015, "trailing_delta": 0.005},
-            min_holding_sec=0.0,
-        )
+    try:
+        with patch("app.core.executor.db", test_db):
+            config = PairConfig(
+                symbol="SOL/USDT:USDT",
+                tp_levels=[[0.01, 0.5], [0.02, 0.5]],  # 50% at 1% TP, 50% at 2% TP
+                stop_loss=0.02,  # 2% SL
+                time_limit=3600,
+                trailing_tp_enabled=False,  # Test legacy trailing stop config independently
+                trailing_stop={"activation_price": 0.015, "trailing_delta": 0.005},
+                min_holding_sec=0.0,
+            )
 
-        # Mock gateway
-        mock_gateway = MagicMock()
-        mock_gateway.get_market_precision.return_value = (2, 3, 0.01, 0.001)
-        mock_gateway.create_exit_order = AsyncMock()
-        mock_gateway.cancel_order = AsyncMock(return_value=True)
+            # Mock gateway
+            mock_gateway = MagicMock()
+            mock_gateway.get_market_precision.return_value = (2, 3, 0.01, 0.001)
+            mock_gateway.create_exit_order = AsyncMock()
+            mock_gateway.cancel_order = AsyncMock(return_value=True)
 
-        # Setup mock return for create_exit_order
-        async def fake_create_exit(**kwargs):
-            return {
-                "id": f"ord_{int(time.time()*1000)}_{kwargs.get('order_type')}",
-                "amount": kwargs.get("amount"),
-                "price": kwargs.get("price"),
-                "stopPrice": kwargs.get("stop_price"),
-                "order_type": kwargs.get("order_type"),
-                "purpose": kwargs.get("purpose"),
-                "params": {"positionSide": kwargs.get("position_side").value},
-            }
-        mock_gateway.create_exit_order.side_effect = fake_create_exit
+            # Setup mock return for create_exit_order
+            async def fake_create_exit(**kwargs):
+                return {
+                    "id": f"ord_{int(time.time()*1000)}_{kwargs.get('order_type')}",
+                    "amount": kwargs.get("amount"),
+                    "price": kwargs.get("price"),
+                    "stopPrice": kwargs.get("stop_price"),
+                    "order_type": kwargs.get("order_type"),
+                    "purpose": kwargs.get("purpose"),
+                    "params": {"positionSide": kwargs.get("position_side").value},
+                }
+            mock_gateway.create_exit_order.side_effect = fake_create_exit
 
-        tracker = PositionTracker(config, mock_gateway)
-        quoter = PMMQuoter(config, 2, 3, 0.01, 0.001)
+            tracker = PositionTracker(config, mock_gateway)
+            quoter = PMMQuoter(config, 2, 3, 0.01, 0.001)
 
-        executor = TripleBarrierExecutor(
-            config=config,
-            position_side=PositionSide.LONG,
-            gateway=mock_gateway,
-            position_tracker=tracker,
-            quoter=quoter,
-        )
+            executor = TripleBarrierExecutor(
+                config=config,
+                position_side=PositionSide.LONG,
+                gateway=mock_gateway,
+                position_tracker=tracker,
+                quoter=quoter,
+            )
 
-        yield executor, tracker, mock_gateway
-
-    await test_db.close()
-    if os.path.exists(temp_path):
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
+            yield executor, tracker, mock_gateway
+    finally:
+        await test_db.close()
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
 @pytest.mark.asyncio

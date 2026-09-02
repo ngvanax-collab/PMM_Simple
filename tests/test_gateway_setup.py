@@ -15,8 +15,11 @@ async def test_db_get_pnl_summary_returns_default_when_not_connected():
     fresh_db = Database(":memory:")
     assert fresh_db._conn is None  # Ensure connection is not set
 
-    result = await fresh_db.get_pnl_summary()
-    assert result == {"total_realized_pnl": 0.0, "total_fee": 0.0, "total_net_pnl": 0.0}
+    try:
+        result = await fresh_db.get_pnl_summary()
+        assert result == {"total_realized_pnl": 0.0, "total_fee": 0.0, "total_net_pnl": 0.0}
+    finally:
+        await fresh_db.close()
 
 
 @pytest.mark.asyncio
@@ -25,8 +28,11 @@ async def test_db_get_recent_fills_returns_empty_when_not_connected():
     fresh_db = Database(":memory:")
     assert fresh_db._conn is None
 
-    result = await fresh_db.get_recent_fills(limit=50)
-    assert result == []
+    try:
+        result = await fresh_db.get_recent_fills(limit=50)
+        assert result == []
+    finally:
+        await fresh_db.close()
 
 
 @pytest.mark.asyncio
@@ -35,8 +41,11 @@ async def test_db_get_active_orders_returns_empty_when_not_connected():
     fresh_db = Database(":memory:")
     assert fresh_db._conn is None
 
-    result = await fresh_db.get_active_orders()
-    assert result == []
+    try:
+        result = await fresh_db.get_active_orders()
+        assert result == []
+    finally:
+        await fresh_db.close()
 
 
 @pytest.mark.asyncio
@@ -65,6 +74,8 @@ async def test_db_record_pnl_returns_zero_when_not_connected():
         await fresh_db.record_pnl(rec)
     except Exception as e:
         assert "AssertionError" not in str(type(e).__name__), f"Must not raise AssertionError, got: {e}"
+    finally:
+        await fresh_db.close()
 
 
 # ── Gateway Leverage / Margin Error Handling Tests ──

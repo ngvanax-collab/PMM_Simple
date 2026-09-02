@@ -138,6 +138,7 @@ async def test_barrier_state_table_migrates_on_existing_db():
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
         db_path = tf.name
 
+    test_db = None
     try:
         # Pre-create old DB schema without barrier_state
         async with aiosqlite.connect(db_path) as conn:
@@ -178,8 +179,11 @@ async def test_barrier_state_table_migrates_on_existing_db():
         await test_db.delete_barrier_state("SOL/USDT:USDT", PositionSide.LONG)
         loaded_after = await test_db.load_barrier_state("SOL/USDT:USDT", PositionSide.LONG)
         assert loaded_after is None
-
-        await test_db.close()
     finally:
+        if test_db is not None:
+            await test_db.close()
         if os.path.exists(db_path):
-            os.remove(db_path)
+            try:
+                os.remove(db_path)
+            except OSError:
+                pass

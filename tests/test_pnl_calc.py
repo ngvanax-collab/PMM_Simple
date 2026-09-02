@@ -172,39 +172,40 @@ async def test_db_get_pnl_summary_from_fills(tmp_path):
     test_db = Database(db_path=db_file)
     await test_db.connect()
 
-    # Save entry and exit fills
-    fill_1 = FillRecord(
-        id="f1",
-        order_id="o1",
-        symbol="ZEC/USDT:USDT",
-        side=OrderSide.BUY,
-        position_side=PositionSide.LONG,
-        price=504.95,
-        amount=1.0,
-        quote_amount=504.95,
-        fee=0.05,
-        timestamp=100.0,
-        realized_pnl=0.0,
-    )
-    fill_2 = FillRecord(
-        id="f2",
-        order_id="o2",
-        symbol="ZEC/USDT:USDT",
-        side=OrderSide.SELL,
-        position_side=PositionSide.LONG,
-        price=501.69,
-        amount=1.0,
-        quote_amount=501.69,
-        fee=0.05,
-        timestamp=105.0,
-        realized_pnl=-3.26,
-    )
-    await test_db.save_fill(fill_1)
-    await test_db.save_fill(fill_2)
+    try:
+        # Save entry and exit fills
+        fill_1 = FillRecord(
+            id="f1",
+            order_id="o1",
+            symbol="ZEC/USDT:USDT",
+            side=OrderSide.BUY,
+            position_side=PositionSide.LONG,
+            price=504.95,
+            amount=1.0,
+            quote_amount=504.95,
+            fee=0.05,
+            timestamp=100.0,
+            realized_pnl=0.0,
+        )
+        fill_2 = FillRecord(
+            id="f2",
+            order_id="o2",
+            symbol="ZEC/USDT:USDT",
+            side=OrderSide.SELL,
+            position_side=PositionSide.LONG,
+            price=501.69,
+            amount=1.0,
+            quote_amount=501.69,
+            fee=0.05,
+            timestamp=105.0,
+            realized_pnl=-3.26,
+        )
+        await test_db.save_fill(fill_1)
+        await test_db.save_fill(fill_2)
 
-    summary = await test_db.get_pnl_summary()
-    assert summary["total_realized_pnl"] == pytest.approx(-3.26, abs=1e-4)
-    assert summary["total_fee"] == pytest.approx(0.10, abs=1e-4)
-    assert summary["total_net_pnl"] == pytest.approx(-3.36, abs=1e-4)
-
-    await test_db.close()
+        summary = await test_db.get_pnl_summary()
+        assert summary["total_realized_pnl"] == pytest.approx(-3.26, abs=1e-4)
+        assert summary["total_fee"] == pytest.approx(0.10, abs=1e-4)
+        assert summary["total_net_pnl"] == pytest.approx(-3.36, abs=1e-4)
+    finally:
+        await test_db.close()
