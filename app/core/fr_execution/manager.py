@@ -96,13 +96,44 @@ class FRManager:
             await asyncio.sleep(self.risk_config.poll_interval_sec)
 
     async def _reconciliation_loop(self) -> None:
-        """Background loop to reconcile open positions with REST every 60 seconds."""
+        """Background loop to reconcile open positions with REST every 60 seconds and poll funding history every 300 seconds."""
+        last_funding_poll = 0.0
         while self._is_running:
             try:
                 if self.gateway.is_connected("binance") or self.gateway.is_connected("bybit"):
                     binance_pos = await self.gateway.fetch_positions("binance")
                     bybit_pos = await self.gateway.fetch_positions("bybit")
                     self.tracker.reconcile_with_exchange_positions(binance_pos, bybit_pos)
+
+                # Periodic funding accrual polling (TASK F-3 / L-2)
+                now = time.time()
+                if now - last_funding_poll >= 300.0:
+                    active_positions = self.tracker.get_active_positions()
+                    active_symbols = {p.symbol for p in active_positions}
+                    for exchange in ("binance", "bybit"):
+                        if not self.gateway.is_connected(exchange):
+                            continue
+                        for symbol in active_symbols:
+                            try:
+                                entries = await self.gateway.fetch_funding_history(exchange, symbol)
+                                for entry in (entries or []):
+                                    info = entry.get("info") if isinstance(entry, dict) and isinstance(entry.get("info"), dict) else {}
+                                    funding_id = info.get("tranId") or entry.get("id") or f"{exchange}_{symbol}_{entry.get('timestamp')}"
+                                    amount = float(info.get("income", entry.get("amount", 0.0)) or 0.0)
+                                    ts_raw = entry.get("timestamp") or time.time()
+                                    ts = (ts_raw / 1000.0) if ts_raw > 1e11 else float(ts_raw)
+                                    pos_side = info.get("positionSide") or ("LONG" if exchange == "binance" else "SHORT")
+                                    self.tracker.record_funding_payment(
+                                        symbol=symbol,
+                                        exchange=exchange,
+                                        position_side=pos_side,
+                                        amount=amount,
+                                        funding_id=str(funding_id),
+                                        timestamp=ts,
+                                    )
+                            except Exception as e:
+                                logger.warning(f"[{exchange.upper()}][{symbol}] Error polling funding history: {e}")
+                    last_funding_poll = now
             except asyncio.CancelledError:
                 break
             except Exception as e:

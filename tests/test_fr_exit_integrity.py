@@ -245,3 +245,95 @@ def test_reconcile_updates_policy_created_position(position_tracker):
     assert updated_pos.short_leg.size == 2.5
     assert updated_pos.short_leg.entry_price == 100.8
     assert updated_pos.status == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_legging_measurement_failure_trips_kill_switch(execution_engine, mock_gateway, position_tracker, kill_switch):
+    """
+    TASK F-2: Fail-closed leg measurement:
+    When Long leg completes, Short leg hangs/times out, but REST fetch_positions raises Exception:
+    - Engine must NOT blindly rollback
+    - Must NOT mark position FLAT
+    - Must trip exchange kill switch
+    - Returns status MEASUREMENT_FAILED
+    """
+    policy = FRPolicy(
+        policy_id="pol_legging_fail_test",
+        symbol="SOL/USDT:USDT",
+        exchange_long="binance",
+        exchange_short="bybit",
+        action=FRAction.OPEN,
+        target_notional_usdt=200.0,
+    )
+
+    async def mock_create_hedge(exchange, symbol, side, position_side, amount, **kwargs):
+        if exchange == "binance":
+            return {"id": "ord_bin_1", "status": "closed", "filled": 1.8}
+        elif exchange == "bybit":
+            await asyncio.sleep(10.0)
+            return {"id": "ord_byb_1", "status": "closed"}
+        return None
+
+    mock_gateway.create_hedge_order = AsyncMock(side_effect=mock_create_hedge)
+    mock_gateway.emergency_market_close = AsyncMock()
+
+    # Simulate fetch_positions raising an exception (e.g. REST failure / network partition)
+    mock_gateway.fetch_positions = AsyncMock(side_effect=RuntimeError("Binance REST 502 Bad Gateway"))
+
+    execution_engine.risk_config.order_timeout_sec = 0.05
+    res = await execution_engine.execute_policy(policy)
+
+    assert res["status"] == "MEASUREMENT_FAILED"
+    assert kill_switch.is_exchange_tripped("binance") is True
+    pos = position_tracker.get_position("SOL/USDT:USDT")
+    assert pos.status != "FLAT"
+    mock_gateway.emergency_market_close.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_funding_polling_records_deduped_payments(mock_gateway, position_tracker, kill_switch):
+    """
+    TASK F-3: Funding accrual polling in FRManager._reconciliation_loop:
+    - Periodically polls fetch_funding_history for active pairs
+    - Accrues real funding payments into tracker.realized_funding_pnl
+    - Deduplicates identical funding transaction IDs across polling intervals.
+    """
+    from app.core.fr_execution.manager import FRManager
+
+    manager = FRManager()
+    manager.gateway = mock_gateway
+    manager.tracker = position_tracker
+    manager.kill_switch = kill_switch
+    manager._is_running = True
+
+    # Seed an active position in tracker
+    sym = "SOL/USDT:USDT"
+    position_tracker.update_leg(sym, "binance", "LONG", size=2.0, entry_price=100.0, mark_price=100.0, upnl=0.0)
+    position_tracker.update_leg(sym, "bybit", "SHORT", size=2.0, entry_price=100.0, mark_price=100.0, upnl=0.0)
+    assert len(position_tracker.get_active_positions()) == 1
+
+    # Mock gateway funding history
+    funding_entry = {
+        "id": "tx_1",
+        "symbol": "SOL/USDT:USDT",
+        "timestamp": 1700000000000,
+        "info": {"tranId": "tx_1", "income": "2.5", "positionSide": "LONG"},
+        "amount": 2.5,
+    }
+    mock_gateway.fetch_funding_history = AsyncMock(return_value=[funding_entry])
+
+    # Run 1 reconciliation beat (stopping after 1 loop)
+    async def stop_after_one_beat(*args, **kwargs):
+        manager._is_running = False
+
+    with patch("asyncio.sleep", side_effect=stop_after_one_beat):
+        await manager._reconciliation_loop()
+
+    assert pytest.approx(position_tracker.realized_funding_pnl, abs=1e-5) == 2.5
+
+    # Run second beat with the same funding history -> should be deduplicated (still 2.5)
+    manager._is_running = True
+    with patch("asyncio.sleep", side_effect=stop_after_one_beat):
+        await manager._reconciliation_loop()
+
+    assert pytest.approx(position_tracker.realized_funding_pnl, abs=1e-5) == 2.5
