@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
+from app.core.circuit_breaker import utc_day_start
 from app.core.executor import TripleBarrierExecutor
 from app.core.gateway import ExchangeGateway
 from app.core.market_state import MarketState
@@ -28,12 +29,11 @@ class PMMWorker:
         min_amt, min_notional = 0.0, 5.0
         if hasattr(gateway, "get_market_limits"):
             try:
-                limits = gateway.get_market_limits(self.symbol)
-                if isinstance(limits, (tuple, list)) and len(limits) == 2:
-                    min_amt, min_notional = limits
-            except Exception:
-                pass
+                min_amt, min_notional = gateway.get_market_limits(self.symbol)
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] Failed to fetch market limits: {e}")
 
+        # Components
         self.market_state = MarketState(config)
         self.quoter = PMMQuoter(
             config=config,
@@ -53,6 +53,7 @@ class PMMWorker:
             gateway=gateway,
             position_tracker=self.tracker,
             quoter=self.quoter,
+            on_isolated_kill=self._trigger_isolated_kill,
         )
         self.executor_short = TripleBarrierExecutor(
             config=config,
@@ -60,6 +61,7 @@ class PMMWorker:
             gateway=gateway,
             position_tracker=self.tracker,
             quoter=self.quoter,
+            on_isolated_kill=self._trigger_isolated_kill,
         )
 
         self._running = False
@@ -172,6 +174,21 @@ class PMMWorker:
 
         # Auto-arm and restore barrier protection (TP/SL/Overflow Recovery)
         await self.reconcile_barriers()
+
+        # Restore daily realized PnL from DB (TASK H-1)
+        try:
+            now = time.time()
+            start_of_day_utc = utc_day_start(now)
+            pnl_summary = await db.get_pnl_summary(symbol=self.symbol, since_timestamp=start_of_day_utc)
+            if pnl_summary:
+                self.session_realized_pnl = float(pnl_summary.get("total_net_pnl", pnl_summary.get("total_realized_pnl", 0.0)) or 0.0)
+                self.peak_pnl = max(0.0, self.session_realized_pnl)
+                logger.info(
+                    f"[{self.symbol}] Restored daily realized PnL from DB (since UTC 00:00 {start_of_day_utc:.0f}): "
+                    f"${self.session_realized_pnl:+.4f} (Peak: ${self.peak_pnl:+.4f})"
+                )
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] Could not restore daily realized PnL on start: {e}")
 
         self._running = True
         self._paused = False
@@ -380,7 +397,13 @@ class PMMWorker:
         cid = str(fill.client_order_id or "").lower()
 
         # 1. Routing classification based on standardized client_order_id prefixes
-        if cid.startswith("q_buy_"):
+        if cid.startswith("q_pyr_"):
+            if "short" in cid:
+                fill.position_side = PositionSide.SHORT
+            elif "long" in cid:
+                fill.position_side = PositionSide.LONG
+            is_entry = True
+        elif cid.startswith("q_buy_"):
             fill.position_side = PositionSide.LONG
             is_entry = True
         elif cid.startswith("q_sell_"):
@@ -415,7 +438,11 @@ class PMMWorker:
         )
 
         # Update position tracker
-        await self.tracker.on_fill(fill)
+        processed = await self.tracker.on_fill(fill)
+        if not processed:
+            logger.warning(f"[{self.symbol}] Duplicate fill {fill.id} ignored at worker level (no executor routing, no PnL write).")
+            return
+
         try:
             await db.save_fill(fill)
         except Exception as e:

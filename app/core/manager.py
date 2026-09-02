@@ -366,7 +366,7 @@ class BotManager:
     # ── Background Health Loop ──
 
     async def _health_monitor_loop(self) -> None:
-        """Periodic background task to check circuit breaker and gross account risk."""
+        """Periodic background task to check account circuit breaker and per-pair loss limits."""
         while self._is_running:
             try:
                 tripped, reason = await self.circuit_breaker.check_account_health(
@@ -377,6 +377,17 @@ class BotManager:
                     logger.critical(f"Circuit Breaker activated! Executing Emergency Kill-All: {reason}")
                     await self.emergency_kill_all()
                     break
+
+                # ── Check per-worker pair daily loss (TASK H-1) ──
+                for worker in list(self.workers.values()):
+                    if worker.is_running and not worker.is_locked_killed:
+                        try:
+                            pair_tripped, pair_reason = await self.circuit_breaker.check_pair_loss(worker.config)
+                            if pair_tripped:
+                                logger.critical(f"[{worker.symbol}] Isolated Pair Loss Circuit Breaker tripped: {pair_reason}")
+                                await worker._trigger_isolated_kill(pair_reason)
+                        except Exception as pe:
+                            logger.error(f"[{worker.symbol}] Error checking pair loss circuit breaker: {pe}")
 
                 await asyncio.sleep(10.0)
             except asyncio.CancelledError:

@@ -242,6 +242,7 @@ class PMMQuoter:
         lev = max(1, self.config.leverage)
         rem_bid_budget: Optional[float] = None
         rem_ask_budget: Optional[float] = None
+        side_notional_budget: Optional[float] = None
 
         if available_margin is not None:
             if available_margin <= 0:
@@ -253,12 +254,23 @@ class PMMQuoter:
 
         # Helper to compute level notional (Inverted Sizing vs Standard Flat/Linear)
         def _get_level_notional(idx: int) -> float:
+            total_power = self.config.effective_margin_cap * lev
+            n_lvls = getattr(self.config, "order_levels", 3)
+            planned_side = (total_power / float(active_sides)) if total_power > 0 else (self.config.order_amount_usdt * n_lvls)
+            if planned_side <= 0:
+                planned_side = self.config.order_amount_usdt * n_lvls
+
             if level_notionals is not None and idx < len(level_notionals):
-                return float(level_notionals[idx])
+                base_val = float(level_notionals[idx])
+                if side_notional_budget is not None:
+                    planned_total = sum(level_notionals)
+                    if planned_total > 0 and planned_total > side_notional_budget:
+                        scale = side_notional_budget / planned_total
+                        return round(base_val * scale, 2)
+                return base_val
 
             ord_lvl_amt = getattr(self.config, "order_level_amount", 0.0)
             if getattr(self.config, "inverted_sizing_enabled", True) and ord_lvl_amt <= 0.0:
-                n_lvls = getattr(self.config, "order_levels", 3)
                 if n_lvls == 3:
                     weights = [0.50, 0.30, 0.20]
                 elif n_lvls == 2:
@@ -266,11 +278,12 @@ class PMMQuoter:
                 else:
                     weights = [1.00]
 
-                total_power = self.config.effective_margin_cap * lev
-                if total_power <= 0:
-                    total_power = self.config.order_amount_usdt * n_lvls
+                target_side = planned_side
+                if side_notional_budget is not None and side_notional_budget < planned_side:
+                    target_side = side_notional_budget
+
                 w = weights[idx] if idx < len(weights) else (1.0 / n_lvls)
-                lvl_val = round(w * total_power, 2)
+                lvl_val = round(w * target_side, 2)
                 return lvl_val
             else:
                 return self.config.order_amount_usdt + idx * ord_lvl_amt
