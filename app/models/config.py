@@ -35,6 +35,18 @@ class PairConfig(BaseModel):
     price_ceiling: float = Field(default=-1.0, description="Max allowed ask price (-1 disables)")
     price_floor: float = Field(default=-1.0, description="Min allowed bid price (-1 disables)")
 
+    # ── Trend Bias & Dynamic VAMM Quoting ──
+    trend_bias_enabled: bool = Field(default=True, description="Enable 1h Trend Bias regime detection & quote blocking")
+    trend_ema_period: int = Field(default=50, ge=5, description="EMA period for 1h trend detection (default 50)")
+    trend_atr_buffer_mult: float = Field(default=0.5, ge=0.0, description="Noise buffer multiplier * ATR 1h (default 0.5)")
+    dynamic_levels_enabled: bool = Field(default=True, description="Automatically adapt order levels N (1, 2, 3) based on Hurst & NATR")
+    inverted_sizing_enabled: bool = Field(default=True, description="Allocate capital with inverted sizing L0 > L1 > L2")
+
+    # ── Momentum Pyramiding ──
+    favorable_pyramiding_enabled: bool = Field(default=True, description="Enable favorable momentum pyramiding")
+    pyramiding_size_pct: float = Field(default=0.50, gt=0.0, le=1.0, description="Pyramid entry size fraction of initial position (default 50%)")
+    pyramiding_trigger_natr_mult: float = Field(default=0.65, gt=0.0, description="60s micro-momentum trigger threshold multiplier * NATR 15m (default 0.65)")
+
     # ── Inventory & Skew (Hedge: 2 independent sides) ──
     inventory_skew_enabled: bool = Field(default=True, description="Enable independent per-side skew")
     max_long_usdt: float = Field(default=96.0, gt=0, description="Max gross position size for LONG in USDT")

@@ -69,6 +69,9 @@ class TripleBarrierExecutor:
             self.state.entry_price = pos_state.entry_price
             self.state.total_qty = pos_state.amount
             self.state.remaining_qty = pos_state.amount
+            if self.state.pyramid_filled_count == 0 or self.state.initial_entry_price <= 0:
+                self.state.initial_entry_price = pos_state.entry_price
+                self.state.initial_qty = pos_state.amount
             self.state.entry_timestamp = time.time()
             self.state.last_update_time = time.time()
 
@@ -83,11 +86,12 @@ class TripleBarrierExecutor:
             self.state.passive_exit_start_time = 0.0
 
             # Calculate Virtual Local Stop Loss trigger price
-            if self.position_side == PositionSide.LONG:
-                raw_sl_price = self.state.entry_price * (1.0 - self.config.stop_loss)
-            else:
-                raw_sl_price = self.state.entry_price * (1.0 + self.config.stop_loss)
-            self.state.sl_price = self.quoter.quantize_price(raw_sl_price)
+            if not self.state.is_guaranteed_sl_locked:
+                if self.position_side == PositionSide.LONG:
+                    raw_sl_price = self.state.entry_price * (1.0 - self.config.stop_loss)
+                else:
+                    raw_sl_price = self.state.entry_price * (1.0 + self.config.stop_loss)
+                self.state.sl_price = self.quoter.quantize_price(raw_sl_price)
             self.state.sl_qty = self.quoter.quantize_amount(self.state.remaining_qty)
 
             logger.info(
@@ -252,6 +256,13 @@ class TripleBarrierExecutor:
                 self.state.passive_exit_active = False
                 self.state.passive_exit_order_id = None
                 self.state.passive_exit_start_time = 0.0
+                self.state.pyramid_filled_count = 0
+                self.state.is_guaranteed_sl_locked = False
+                self.state.initial_entry_price = 0.0
+                self.state.initial_qty = 0.0
+                pos_state = self.tracker.get_state(self.position_side)
+                pos_state.pyramid_filled_count = 0
+                pos_state.is_guaranteed_sl_locked = False
                 return
 
             # Partial exit: Re-place TP orders for remaining quantity to protect position
@@ -329,14 +340,147 @@ class TripleBarrierExecutor:
                     f"[{self.symbol}][{self.position_side.value}] TP #{idx} placed: {qty:.4f} @ {tp_price:.4f} (order_id={order_id})"
                 )
 
+    async def check_favorable_momentum_pyramid(
+        self,
+        current_price: float,
+        market_state: Optional[Any] = None,
+    ) -> bool:
+        """
+        Check & Execute Favorable Momentum Pyramiding + Guaranteed Profit SL:
+        1. Conditions:
+           - favorable_pyramiding_enabled is True.
+           - Position active and remaining_qty > 0.
+           - pyramid_filled_count == 0.
+           - uPnL >= trailing_tp_activation_pct.
+           - 60s momentum in favorable direction >= pyramiding_trigger_natr_mult * NATR_15m.
+        2. Actions:
+           - Send MARKET entry order for 50% initial size.
+           - Calculate new average entry price P_avg_new.
+           - Move Virtual SL to Guaranteed Profit (Lock Breakeven/Profit).
+           - Tighten trailing_tp_callback_pct to 20% of TP_base.
+           - Synchronize Take Profit orders.
+        """
+        if not getattr(self.config, "favorable_pyramiding_enabled", True):
+            return False
+
+        if not self.state.active or self.state.remaining_qty <= 1e-7 or self._is_exiting or self.state.pyramid_filled_count > 0:
+            return False
+
+        if self.state.entry_price <= 0 or current_price <= 0:
+            return False
+
+        act_pct = getattr(self.config, "trailing_tp_activation_pct", 0.008)
+        if self.position_side == PositionSide.LONG:
+            upnl_pct = (current_price - self.state.entry_price) / self.state.entry_price
+        else:
+            upnl_pct = (self.state.entry_price - current_price) / self.state.entry_price
+
+        if upnl_pct < act_pct:
+            return False
+
+        # Check 60s micro-momentum in favorable direction
+        natr_15m = 0.012
+        surge_up, plunge_down = 0.0, 0.0
+        if market_state is not None:
+            natr_15m = getattr(market_state, "current_natr_15m", 0.012)
+            if hasattr(market_state, "get_favorable_momentum_60s"):
+                surge_up, plunge_down = market_state.get_favorable_momentum_60s()
+
+        mult = getattr(self.config, "pyramiding_trigger_natr_mult", 0.65)
+        threshold = mult * natr_15m
+
+        favorable_momentum = surge_up if self.position_side == PositionSide.LONG else plunge_down
+        if favorable_momentum < threshold:
+            return False
+
+        pyr_pct = getattr(self.config, "pyramiding_size_pct", 0.50)
+        init_qty = self.state.initial_qty if self.state.initial_qty > 0 else self.state.total_qty
+        init_p = self.state.initial_entry_price if self.state.initial_entry_price > 0 else self.state.entry_price
+        if init_qty <= 0:
+            init_qty = self.state.remaining_qty
+        if init_p <= 0:
+            init_p = self.state.entry_price
+
+        pyr_qty = self.quoter.quantize_amount(init_qty * pyr_pct)
+        if pyr_qty <= 0:
+            return False
+
+        entry_side = OrderSide.BUY if self.position_side == PositionSide.LONG else OrderSide.SELL
+        client_id = f"q_pyr_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+
+        logger.info(
+            f"[{self.symbol}][{self.position_side.value}][MOMENTUM_PYRAMID] Favorable Momentum Pyramid triggered: "
+            f"uPnL={upnl_pct*100:.2f}% >= {act_pct*100:.2f}%, Momentum={favorable_momentum*100:.2f}% >= {threshold*100:.2f}%. "
+            f"Adding {pyr_qty:.4f} {self.position_side.value} via Market entry..."
+        )
+
+        resp = await self.gateway.create_entry_market_order(
+            symbol=self.symbol,
+            side=entry_side,
+            position_side=self.position_side,
+            amount=pyr_qty,
+            client_order_id=client_id,
+        )
+
+        if not resp:
+            logger.error(f"[{self.symbol}][{self.position_side.value}][MOMENTUM_PYRAMID] Failed to place pyramid entry order!")
+            return False
+
+        # Update position size and average price
+        self.state.pyramid_filled_count = 1
+        old_qty = self.state.remaining_qty
+        old_entry = self.state.entry_price
+        new_total_qty = self.quoter.quantize_amount(old_qty + pyr_qty)
+        new_avg_price = (old_qty * old_entry + pyr_qty * current_price) / new_total_qty
+
+        self.state.entry_price = new_avg_price
+        self.state.total_qty = new_total_qty
+        self.state.remaining_qty = new_total_qty
+        self.state.sl_qty = new_total_qty
+
+        pos_state = self.tracker.get_state(self.position_side)
+        pos_state.amount = new_total_qty
+        pos_state.entry_price = new_avg_price
+        pos_state.pyramid_filled_count = 1
+
+        # Move Stop Loss to Guaranteed Profit Stop Loss
+        s_floor = self.quoter.calculate_spread_floor(new_avg_price)
+        if self.position_side == PositionSide.LONG:
+            raw_sl = max(new_avg_price * (1.0 + s_floor), init_p * 1.0035)
+        else:
+            raw_sl = min(new_avg_price * (1.0 - s_floor), init_p * 0.9965)
+
+        self.state.sl_price = self.quoter.quantize_price(raw_sl)
+        self.state.is_guaranteed_sl_locked = True
+        pos_state.is_guaranteed_sl_locked = True
+
+        # Tighten Trailing TP Callback
+        tp_base = getattr(self.config, "take_profit", 0.008)
+        tight_cb = max(0.0020, 0.20 * tp_base)
+        self.config.trailing_tp_callback_pct = tight_cb
+
+        logger.info(
+            f"[{self.symbol}][{self.position_side.value}][MOMENTUM_PYRAMID] Pyramid executed: +{pyr_qty:.4f} -> total={new_total_qty:.4f} @ new_avg={new_avg_price:.4f}"
+        )
+        logger.info(
+            f"[{self.symbol}][{self.position_side.value}][GUARANTEED_SL] Stop Loss locked at {self.state.sl_price:.4f} "
+            f"(Initial Entry={init_p:.4f}, New Avg={new_avg_price:.4f}, s_floor={s_floor*100:.3f}%). Trailing callback tightened to {tight_cb*100:.2f}%."
+        )
+
+        # Synchronize / re-place Take Profit orders with updated quantity
+        await self._place_take_profit_orders()
+        return True
+
     async def check_runtime_barriers(
         self,
         current_price: float,
         best_bid: float = 0.0,
         best_ask: float = 0.0,
+        market_state: Optional[Any] = None,
     ) -> None:
         """
-        Check Virtual Local Stop Loss, Minimum Holding Lock, Dynamic Trailing TP, and Passive Exit on every price tick.
+        Check Virtual Local Stop Loss, Guaranteed Profit SL, Minimum Holding Lock,
+        Favorable Momentum Pyramiding, Dynamic Trailing TP, and Passive Exit on every price tick.
         """
         if not self.state.active or self.state.remaining_qty <= 1e-7 or self._is_exiting or current_price <= 0:
             return
@@ -348,21 +492,31 @@ class TripleBarrierExecutor:
             now = time.time()
             elapsed = now - self.state.entry_timestamp
 
-            # ── 1. Virtual Local Stop Loss (Highest Priority — Can trigger at any time) ──
+            # ── 1. Virtual Local Stop Loss / Guaranteed Profit SL (Highest Priority) ──
             if self.position_side == PositionSide.LONG:
-                sl_trigger = self.state.entry_price * (1.0 - self.config.stop_loss)
+                if self.state.is_guaranteed_sl_locked and self.state.sl_price > 0:
+                    sl_trigger = self.state.sl_price
+                else:
+                    sl_trigger = self.state.sl_price if self.state.sl_price > 0 else self.state.entry_price * (1.0 - self.config.stop_loss)
+
                 if current_price <= sl_trigger:
+                    tag = "GUARANTEED_SL" if self.state.is_guaranteed_sl_locked else "VIRTUAL_SL"
                     logger.critical(
-                        f"[{self.symbol}][LONG][VIRTUAL_SL] Mark price {current_price:.4f} <= SL trigger {sl_trigger:.4f}. "
+                        f"[{self.symbol}][LONG][{tag}] Mark price {current_price:.4f} <= SL trigger {sl_trigger:.4f}. "
                         f"Executing emergency market exit."
                     )
                     await self._execute_market_exit(purpose=OrderPurpose.STOP_LOSS)
                     return
             else:  # SHORT
-                sl_trigger = self.state.entry_price * (1.0 + self.config.stop_loss)
+                if self.state.is_guaranteed_sl_locked and self.state.sl_price > 0:
+                    sl_trigger = self.state.sl_price
+                else:
+                    sl_trigger = self.state.sl_price if self.state.sl_price > 0 else self.state.entry_price * (1.0 + self.config.stop_loss)
+
                 if current_price >= sl_trigger:
+                    tag = "GUARANTEED_SL" if self.state.is_guaranteed_sl_locked else "VIRTUAL_SL"
                     logger.critical(
-                        f"[{self.symbol}][SHORT][VIRTUAL_SL] Mark price {current_price:.4f} >= SL trigger {sl_trigger:.4f}. "
+                        f"[{self.symbol}][SHORT][{tag}] Mark price {current_price:.4f} >= SL trigger {sl_trigger:.4f}. "
                         f"Executing emergency market exit."
                     )
                     await self._execute_market_exit(purpose=OrderPurpose.STOP_LOSS)
@@ -373,7 +527,10 @@ class TripleBarrierExecutor:
             if elapsed < min_hold:
                 return
 
-            # ── 3. Dynamic Trailing Take Profit (Floating Profit Capture) ──
+            # ── 3. Favorable Momentum Pyramiding Check ──
+            await self.check_favorable_momentum_pyramid(current_price, market_state=market_state)
+
+            # ── 4. Dynamic Trailing Take Profit (Floating Profit Capture) ──
             trailing_tp_enabled = getattr(self.config, "trailing_tp_enabled", True)
             if trailing_tp_enabled and self.state.entry_price > 0:
                 act_pct = getattr(self.config, "trailing_tp_activation_pct", 0.008)

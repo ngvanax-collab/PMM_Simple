@@ -258,6 +258,48 @@ class ExchangeGateway:
                         logger.error(f"[{symbol}] Failed to create quote order ({side} {position_side}): {err_msg}")
                     return None
 
+    async def create_entry_market_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        position_side: PositionSide,
+        amount: float,
+        client_order_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create Market Entry Order in Hedge Mode (e.g. for Momentum Pyramiding).
+        CRITICAL: Never uses reduceOnly or closePosition!
+        LONG entry = BUY with positionSide=LONG.
+        SHORT entry = SELL with positionSide=SHORT.
+        """
+        assert position_side in (PositionSide.LONG, PositionSide.SHORT), "Hedge mode requires LONG or SHORT"
+        if not self._exchange:
+            return None
+
+        fmt_amount = self.amount_to_precision(symbol, amount)
+        cid = client_order_id or f"q_pyr_{int(time.time()*1000)}"
+        params: Dict[str, Any] = {
+            "positionSide": position_side.value,
+            "newClientOrderId": cid,
+            "clientOrderId": cid,
+        }
+        if self.exchange_name == "bybit":
+            params["positionIdx"] = 1 if position_side == PositionSide.LONG else 2
+
+        await rate_limiter.acquire_order(count=1, weight=1)
+        try:
+            order = await self._exchange.create_order(
+                symbol=symbol,
+                type="market",
+                side=side.value.lower(),
+                amount=fmt_amount,
+                params=params,
+            )
+            return order
+        except Exception as e:
+            logger.error(f"[{symbol}] Failed to create market entry order ({side} {position_side}): {e}")
+            return None
+
     async def create_exit_order(
         self,
         symbol: str,
@@ -562,6 +604,21 @@ class ExchangeGateway:
         except Exception as e:
             logger.warning(f"Failed to fetch free balance for {currency}: {e}")
             return 0.0
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = "1h", limit: int = 100) -> List[List[float]]:
+        """Fetch historical OHLCV candles from exchange with rate-limiting."""
+        if not self._exchange:
+            return []
+
+        await rate_limiter.acquire_weight(weight=2)
+        try:
+            if hasattr(self._exchange, "fetch_ohlcv"):
+                candles = await self._exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+                return candles or []
+            return []
+        except Exception as e:
+            logger.warning(f"[{symbol}] Failed to fetch OHLCV ({timeframe}): {e}")
+            return []
 
     async def fetch_ticker_and_mark(self, symbol: str) -> Optional[Dict[str, float]]:
         """Fetch bid, ask, last, mark price and funding rate with orderbook fallback."""

@@ -2,10 +2,40 @@
 import math
 import time
 from collections import deque
-from typing import Deque, Optional, Tuple
+from typing import Deque, List, Optional, Tuple
 from loguru import logger
 
 from app.models.config import PairConfig
+
+
+def calculate_ema(prices: List[float], period: int = 50) -> float:
+    """Calculate Exponential Moving Average (EMA) of a price series."""
+    if not prices:
+        return 0.0
+    if len(prices) == 1:
+        return prices[0]
+    alpha = 2.0 / (period + 1.0)
+    ema = sum(prices[:min(len(prices), period)]) / min(len(prices), period)
+    for p in prices[min(len(prices), period):]:
+        ema = alpha * p + (1.0 - alpha) * ema
+    return float(ema)
+
+
+def calculate_atr_from_candles(candles: List[List[float]], period: int = 14) -> float:
+    """Calculate Average True Range (ATR) in price units from OHLCV candles."""
+    if len(candles) < 2:
+        return 0.0
+    tr_list = []
+    for i in range(1, len(candles)):
+        high = float(candles[i][2])
+        low = float(candles[i][3])
+        prev_close = float(candles[i - 1][4])
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        tr_list.append(tr)
+    if not tr_list:
+        return 0.0
+    recent_tr = tr_list[-min(len(tr_list), period):]
+    return float(sum(recent_tr) / len(recent_tr))
 
 
 class MarketState:
@@ -32,6 +62,11 @@ class MarketState:
         self.price_history_60s: Deque[Tuple[float, float]] = deque()
         self.circuit_breaker_paused_until: float = 0.0
         self.current_natr_15m: float = 0.012  # Default 1.2% (0.012 in decimal)
+
+        # ── Trend Bias 1h Regime State ──
+        self.trend_bias_regime: str = "NEUTRAL"
+        self.last_ema50: float = 0.0
+        self.last_atr_1h: float = 0.0
 
     def update_natr_15m(self, natr: float) -> None:
         """Update 15m NATR for dynamic circuit breaker thresholding."""
@@ -189,3 +224,77 @@ class MarketState:
                     return False, f"Volatility surge: {swing_pct:.4f} > max allowed {self.config.vol_pause_pct:.4f} in {lookback}s"
 
         return True, "OK"
+
+    def update_trend_bias(self, candles_1h: List[List[float]]) -> str:
+        """
+        Update 1h Trend Bias regime based on EMA50 and ATR14:
+        - Close > EMA50 + (trend_atr_buffer_mult * ATR_1h) -> BULLISH
+        - Close < EMA50 - (trend_atr_buffer_mult * ATR_1h) -> BEARISH
+        - Otherwise -> NEUTRAL
+        """
+        if not getattr(self.config, "trend_bias_enabled", True):
+            self.trend_bias_regime = "NEUTRAL"
+            return "NEUTRAL"
+
+        if not candles_1h or len(candles_1h) < 10:
+            return self.trend_bias_regime
+
+        closes = [float(c[4]) for c in candles_1h if len(c) >= 5 and float(c[4]) > 0]
+        if not closes:
+            return self.trend_bias_regime
+
+        period = getattr(self.config, "trend_ema_period", 50)
+        buffer_mult = getattr(self.config, "trend_atr_buffer_mult", 0.5)
+
+        ema_val = calculate_ema(closes, period=period)
+        atr_val = calculate_atr_from_candles(candles_1h, period=14)
+
+        last_close = closes[-1]
+        buffer = buffer_mult * atr_val
+
+        if last_close > (ema_val + buffer):
+            regime = "BULLISH"
+        elif last_close < (ema_val - buffer):
+            regime = "BEARISH"
+        else:
+            regime = "NEUTRAL"
+
+        self.trend_bias_regime = regime
+        self.last_ema50 = ema_val
+        self.last_atr_1h = atr_val
+
+        logger.info(
+            f"[{self.symbol}][TREND_BIAS] 1h Close={last_close:.4f} vs EMA{period}={ema_val:.4f} "
+            f"+- {buffer:.4f} (ATR={atr_val:.4f}) -> Regime: {regime}"
+        )
+        return regime
+
+    def get_favorable_momentum_60s(self, current_time: Optional[float] = None) -> Tuple[float, float]:
+        """
+        Calculate 60s micro-momentum in upward and downward directions:
+        - surge_up = (current_price - min_price_60s) / min_price_60s
+        - plunge_down = (max_price_60s - current_price) / max_price_60s
+        Returns: (surge_up, plunge_down)
+        """
+        now = current_time if current_time is not None else time.time()
+        lookback = getattr(self.config, "circuit_breaker_lookback_sec", 60)
+
+        while self.price_history_60s and (now - self.price_history_60s[0][0]) > lookback:
+            self.price_history_60s.popleft()
+
+        if len(self.price_history_60s) < 2:
+            return 0.0, 0.0
+
+        prices = [p for _, p in self.price_history_60s if p > 0]
+        if not prices:
+            return 0.0, 0.0
+
+        curr_p = prices[-1]
+        min_p = min(prices)
+        max_p = max(prices)
+
+        surge_up = (curr_p - min_p) / min_p if min_p > 0 else 0.0
+        plunge_down = (max_p - curr_p) / max_p if max_p > 0 else 0.0
+
+        return float(surge_up), float(plunge_down)
+

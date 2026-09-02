@@ -124,7 +124,19 @@ class PMMWorker:
             logger.info(f"[{self.symbol}] Worker exited DRAINING mode.")
 
     async def _init_market_state(self) -> None:
-        """Fetch initial ticker/orderbook from exchange to prime market_state before quoting."""
+        """Fetch initial ticker/orderbook and 1h candles to prime market_state and trend bias before quoting."""
+        if hasattr(self.gateway, "fetch_ohlcv") and getattr(self.config, "trend_bias_enabled", True):
+            try:
+                candles_1h = await self.gateway.fetch_ohlcv(self.symbol, timeframe="1h", limit=100)
+                if candles_1h:
+                    regime = self.market_state.update_trend_bias(candles_1h)
+                    self.tracker.long_pos.trend_bias_regime = regime
+                    self.tracker.short_pos.trend_bias_regime = regime
+                    self.tracker.long_pos.is_trend_blocked = (regime == "BEARISH")
+                    self.tracker.short_pos.is_trend_blocked = (regime == "BULLISH")
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] Initial trend bias load note: {e}")
+
         for attempt in range(3):
             try:
                 ticker = await self.gateway.fetch_ticker_and_mark(self.symbol)
@@ -356,9 +368,9 @@ class PMMWorker:
         # Check isolated risk breach
         await self._check_isolated_risk_breach()
 
-        # Check runtime barriers (Virtual SL / Trailing TP / Passive Exit)
-        await self.executor_long.check_runtime_barriers(mark, best_bid=bid, best_ask=ask)
-        await self.executor_short.check_runtime_barriers(mark, best_bid=bid, best_ask=ask)
+        # Check runtime barriers (Virtual SL / Trailing TP / Passive Exit / Pyramiding)
+        await self.executor_long.check_runtime_barriers(mark, best_bid=bid, best_ask=ask, market_state=self.market_state)
+        await self.executor_short.check_runtime_barriers(mark, best_bid=bid, best_ask=ask, market_state=self.market_state)
 
     async def on_fill(self, fill: FillRecord) -> None:
         """Handle trade fill event."""
@@ -452,6 +464,7 @@ class PMMWorker:
     async def _main_worker_loop(self) -> None:
         """Main loop checking market sanity, refresh timers, hanging orders, and reconcile."""
         last_reconcile = time.time()
+        last_trend_check = time.time()
         last_sanity_warning = 0.0
 
         while self._running:
@@ -472,13 +485,27 @@ class PMMWorker:
                     await asyncio.sleep(1.0)
                     continue
 
-                # 2. Periodic Reconciliation Heartbeat
+                # 2. Periodic Reconciliation Heartbeat & Trend Bias Refresh
                 now = time.time()
                 reconcile_interval = getattr(self.config, "reconcile_interval_sec", 60)
                 if now - last_reconcile >= reconcile_interval:
                     await self.tracker.reconcile_with_exchange()
                     await self.reconcile_barriers()
                     last_reconcile = now
+
+                if getattr(self.config, "trend_bias_enabled", True) and (now - last_trend_check >= 300.0):
+                    if hasattr(self.gateway, "fetch_ohlcv"):
+                        try:
+                            candles_1h = await self.gateway.fetch_ohlcv(self.symbol, timeframe="1h", limit=100)
+                            if candles_1h:
+                                regime = self.market_state.update_trend_bias(candles_1h)
+                                self.tracker.long_pos.trend_bias_regime = regime
+                                self.tracker.short_pos.trend_bias_regime = regime
+                                self.tracker.long_pos.is_trend_blocked = (regime == "BEARISH")
+                                self.tracker.short_pos.is_trend_blocked = (regime == "BULLISH")
+                                last_trend_check = now
+                        except Exception as e:
+                            logger.warning(f"[{self.symbol}] Periodic trend bias update note: {e}")
 
                 # 3. Check if requote is triggered
                 should_requote, reason = self._check_should_requote()
@@ -632,6 +659,7 @@ class PMMWorker:
                 long_state=long_state,
                 short_state=short_state,
                 mark_price=real_mark,
+                trend_bias_regime=self.market_state.trend_bias_regime,
             )
 
             target_quotes = bids + asks

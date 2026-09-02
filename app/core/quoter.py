@@ -173,15 +173,34 @@ class PMMQuoter:
         short_state: Optional[Any] = None,
         current_time: Optional[float] = None,
         mark_price: Optional[float] = None,
+        trend_bias_regime: str = "NEUTRAL",
+        level_notionals: Optional[List[float]] = None,
     ) -> Tuple[List[QuoteLevel], List[QuoteLevel]]:
         """
-        Generate bid (LONG entry) and ask (SHORT entry) quote levels with independent skew and ladder throttling.
-        If long_state/short_state provided, enforces sequential quoting (Level 0 when flat, Level i after 30m cooldown if price condition met).
+        Generate bid (LONG entry) and ask (SHORT entry) quote levels with independent skew,
+        Trend Bias blocking, Inverted Grid Sizing, and ladder throttling.
+        If long_state/short_state provided, enforces sequential quoting.
         If available_margin is provided, auto-scales order amounts and limits levels to available margin.
         Returns: (bids, asks)
         """
         if smoothed_mid <= 0:
             return [], []
+
+        # ── 0. Trend Bias Check ──
+        regime = trend_bias_regime
+        if long_state is not None and getattr(long_state, "trend_bias_regime", None):
+            regime = getattr(long_state, "trend_bias_regime", regime)
+        elif short_state is not None and getattr(short_state, "trend_bias_regime", None):
+            regime = getattr(short_state, "trend_bias_regime", regime)
+
+        trend_bias_enabled = getattr(self.config, "trend_bias_enabled", True)
+        if trend_bias_enabled:
+            if regime == "BULLISH":
+                pause_short_entry = True
+                logger.info(f"[{self.config.symbol}][TREND_BIAS] BULLISH regime active: Suppressing ASK quotes (Short Entry blocked)")
+            elif regime == "BEARISH":
+                pause_long_entry = True
+                logger.info(f"[{self.config.symbol}][TREND_BIAS] BEARISH regime active: Suppressing BID quotes (Long Entry blocked)")
 
         # ── 1. Calculate per-side inventory skew ──
         rho_long = min(1.0, max(0.0, long_value_usdt / max(1.0, self.config.max_long_usdt)))
@@ -231,6 +250,30 @@ class PMMQuoter:
             side_notional_budget = side_margin_budget * lev
             rem_bid_budget = side_notional_budget if not long_cap_reached else 0.0
             rem_ask_budget = side_notional_budget if not short_cap_reached else 0.0
+
+        # Helper to compute level notional (Inverted Sizing vs Standard Flat/Linear)
+        def _get_level_notional(idx: int) -> float:
+            if level_notionals is not None and idx < len(level_notionals):
+                return float(level_notionals[idx])
+
+            ord_lvl_amt = getattr(self.config, "order_level_amount", 0.0)
+            if getattr(self.config, "inverted_sizing_enabled", True) and ord_lvl_amt <= 0.0:
+                n_lvls = getattr(self.config, "order_levels", 3)
+                if n_lvls == 3:
+                    weights = [0.50, 0.30, 0.20]
+                elif n_lvls == 2:
+                    weights = [0.60, 0.40]
+                else:
+                    weights = [1.00]
+
+                total_power = self.config.effective_margin_cap * lev
+                if total_power <= 0:
+                    total_power = self.config.order_amount_usdt * n_lvls
+                w = weights[idx] if idx < len(weights) else (1.0 / n_lvls)
+                lvl_val = round(w * total_power, 2)
+                return lvl_val
+            else:
+                return self.config.order_amount_usdt + idx * ord_lvl_amt
 
         # ── 2. Generate Bid Levels (BUY for positionSide=LONG) ──
         if not long_cap_reached:
@@ -291,7 +334,7 @@ class PMMQuoter:
                 if bid_price is None or bid_price <= 0:
                     continue
 
-                amount_usdt = self.config.order_amount_usdt + i * self.config.order_level_amount
+                amount_usdt = _get_level_notional(i)
                 # Ensure we don't exceed max_long_usdt with this level
                 if long_value_usdt + amount_usdt > self.config.max_long_usdt:
                     amount_usdt = max(self.min_notional, self.config.max_long_usdt - long_value_usdt)
@@ -391,7 +434,7 @@ class PMMQuoter:
                 if ask_price is None or ask_price <= 0:
                     continue
 
-                amount_usdt = self.config.order_amount_usdt + i * self.config.order_level_amount
+                amount_usdt = _get_level_notional(i)
                 if short_value_usdt + amount_usdt > self.config.max_short_usdt:
                     amount_usdt = max(self.min_notional, self.config.max_short_usdt - short_value_usdt)
 

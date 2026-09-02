@@ -109,6 +109,10 @@ class SidePositionState(BaseModel):
     filled_levels_count: int = Field(default=0, ge=0, description="Number of order levels currently filled (0, 1, 2, 3...)")
     last_level_fill_time: float = Field(default=0.0, description="Timestamp of most recent level fill")
     next_allowed_level_time: float = Field(default=0.0, description="Timestamp when next level quoting is permitted")
+    is_trend_blocked: bool = Field(default=False, description="Flag indicating entry quote is blocked by trend bias")
+    pyramid_filled_count: int = Field(default=0, ge=0, description="Number of favorable pyramid fills in current position cycle (max 1)")
+    is_guaranteed_sl_locked: bool = Field(default=False, description="Flag confirming Stop Loss is locked to guaranteed breakeven/profit")
+    trend_bias_regime: str = Field(default="NEUTRAL", description="Trend regime: BULLISH, BEARISH, NEUTRAL")
 
 
 class ExecutorBarrierState(BaseModel):
@@ -117,7 +121,9 @@ class ExecutorBarrierState(BaseModel):
     position_side: PositionSide = Field(..., description="LONG or SHORT")
     active: bool = Field(default=False, description="Whether position is open and barrier is actively managing")
     entry_price: float = Field(default=0.0, description="Average entry price")
+    initial_entry_price: float = Field(default=0.0, description="Initial entry price before pyramiding")
     total_qty: float = Field(default=0.0, description="Total initial quantity of position cycle")
+    initial_qty: float = Field(default=0.0, description="Initial quantity before pyramiding")
     remaining_qty: float = Field(default=0.0, description="Remaining unclosed quantity")
     tp_orders: List[Dict[str, Any]] = Field(default_factory=list, description="Active TP orders: [{order_id, price, qty, status, level}]")
     sl_order_id: Optional[str] = Field(default=None, description="Active server-side STOP_MARKET order ID if any")
@@ -134,6 +140,10 @@ class ExecutorBarrierState(BaseModel):
     entry_timestamp: float = Field(default=0.0, description="When position was opened")
     last_update_time: float = Field(default=0.0, description="Last update timestamp")
     filled_levels_count: int = Field(default=0, ge=0, description="Number of levels filled in current position cycle")
+    is_trend_blocked: bool = Field(default=False, description="Flag indicating entry quote is blocked by trend bias")
+    pyramid_filled_count: int = Field(default=0, ge=0, description="Number of favorable pyramid fills in current position cycle (max 1)")
+    is_guaranteed_sl_locked: bool = Field(default=False, description="Flag confirming Stop Loss is locked to guaranteed breakeven/profit")
+    trend_bias_regime: str = Field(default="NEUTRAL", description="Trend regime: BULLISH, BEARISH, NEUTRAL")
 
 
 class PnLRecord(BaseModel):
