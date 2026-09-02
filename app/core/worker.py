@@ -438,7 +438,11 @@ class PMMWorker:
         )
 
         # Update position tracker
-        await self.tracker.on_fill(fill)
+        processed = await self.tracker.on_fill(fill)
+        if not processed:
+            logger.warning(f"[{self.symbol}] Duplicate fill {fill.id} ignored at worker level (no executor routing, no PnL write).")
+            return
+
         try:
             await db.save_fill(fill)
         except Exception as e:

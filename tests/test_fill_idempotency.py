@@ -48,12 +48,75 @@ async def test_duplicate_fill_id_ignored():
     )
 
     # First delivery
-    await tracker.on_fill(fill_1)
+    res1 = await tracker.on_fill(fill_1)
+    assert res1 is True
     assert tracker.long_pos.amount == 1.0
 
     # Duplicate delivery
-    await tracker.on_fill(fill_1)
+    res2 = await tracker.on_fill(fill_1)
+    assert res2 is False
     assert tracker.long_pos.amount == 1.0  # Amount must NOT double to 2.0
+
+
+@pytest.mark.asyncio
+async def test_duplicate_exit_fill_not_double_counted_at_worker_level():
+    """
+    Test that duplicate exit fill events do not cause duplicate executor routing,
+    duplicate PnL DB records, or double-counted session_realized_pnl.
+    """
+    cfg = PairConfig(symbol="SOL/USDT:USDT", leverage=5)
+    mock_gw = MagicMock()
+    mock_gw.get_market_precision.return_value = (2, 3, 0.01, 0.001)
+    mock_gw.get_market_limits.return_value = (0.0, 5.0)
+    mock_gw.create_exit_order = AsyncMock(return_value={"id": "exit_1", "status": "closed"})
+    mock_gw.cancel_order = AsyncMock()
+
+    worker = PMMWorker(cfg, mock_gw)
+
+    with patch("app.core.executor.db.record_pnl", new_callable=AsyncMock) as mock_record_pnl:
+        # Open 2.0 LONG
+        entry_fill = FillRecord(
+            id="fill_entry_1",
+            order_id="ord_entry_1",
+            client_order_id="q_buy_0",
+            symbol="SOL/USDT:USDT",
+            side=OrderSide.BUY,
+            position_side=PositionSide.LONG,
+            price=100.0,
+            amount=2.0,
+            quote_amount=200.0,
+            timestamp=1000.0,
+            realized_pnl=0.0,
+        )
+        await worker.on_fill(entry_fill)
+        assert worker.tracker.long_pos.amount == 2.0
+        assert worker.executor_long.state.remaining_qty == 2.0
+
+        # Emit exit fill id="fill_tp_dup" amount 1.0 realized_pnl=1.0
+        exit_fill = FillRecord(
+            id="fill_tp_dup",
+            order_id="ord_tp_dup",
+            client_order_id="tp_long_0",
+            symbol="SOL/USDT:USDT",
+            side=OrderSide.SELL,
+            position_side=PositionSide.LONG,
+            price=101.0,
+            amount=1.0,
+            quote_amount=101.0,
+            timestamp=1010.0,
+            realized_pnl=1.0,
+            fee=0.0,
+        )
+        await worker.on_fill(exit_fill)
+        assert worker.session_realized_pnl == pytest.approx(1.0, abs=1e-5)
+        assert worker.executor_long.state.remaining_qty == pytest.approx(1.0, abs=1e-5)
+        assert mock_record_pnl.call_count == 1
+
+        # Emit duplicate exit fill
+        await worker.on_fill(exit_fill)
+        assert worker.session_realized_pnl == pytest.approx(1.0, abs=1e-5)
+        assert worker.executor_long.state.remaining_qty == pytest.approx(1.0, abs=1e-5)
+        assert mock_record_pnl.call_count == 1
 
 
 @pytest.mark.asyncio

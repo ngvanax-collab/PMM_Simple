@@ -92,7 +92,7 @@ class PositionTracker:
                 st.in_cooldown = False
                 logger.info(f"[{self.symbol}][{side.value}][SIDE_COOLDOWN] Take Profit executed with profit. Progressive Cooldown reset to base.")
 
-    async def on_fill(self, fill: FillRecord) -> None:
+    async def on_fill(self, fill: FillRecord) -> bool:
         """Process incoming trade fill to update position state."""
         async with self._lock:
             # Check fill idempotency (exactly-once processing)
@@ -101,7 +101,7 @@ class PositionTracker:
                     logger.warning(
                         f"[{self.symbol}][IDEMPOTENCY] Duplicate fill event detected and ignored: id={fill.id}, cid={fill.client_order_id}"
                     )
-                    return
+                    return False
                 if len(self._processed_fill_order) == self._processed_fill_order.maxlen:
                     oldest_id = self._processed_fill_order.popleft()
                     self._processed_fill_ids.discard(oldest_id)
@@ -170,6 +170,7 @@ class PositionTracker:
                 )
 
             self._update_notional_and_upnl(state, state.current_price or fill.price)
+            return True
 
     def update_mark_price(self, mark_price: float) -> None:
         """Update unrealized PnL and notional from latest mark price."""
