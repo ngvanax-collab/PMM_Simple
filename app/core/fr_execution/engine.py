@@ -76,13 +76,39 @@ class FRExecutionEngine:
 
     # ── Action Handlers ──
 
+    async def _actual_leg_size(self, exchange: str, symbol: str, position_side: str) -> Optional[float]:
+        """
+        Query actual live position size from exchange for a specific leg side.
+        Parses contracts | positionAmt | size (absolute value).
+        Returns None if fetch failed (fail-closed), 0.0 if fetch succeeded and no position.
+        """
+        try:
+            raw_positions = await self.gateway.fetch_positions(exchange, symbols=[symbol])
+            pos_side_upper = position_side.upper()
+            for raw in raw_positions:
+                r_side = str(raw.get("side", raw.get("positionSide", "BOTH"))).upper()
+                pos_idx = raw.get("positionIdx")
+                if pos_idx is not None:
+                    if pos_idx == 1:
+                        r_side = "LONG"
+                    elif pos_idx == 2:
+                        r_side = "SHORT"
+                if r_side == pos_side_upper or r_side == "BOTH":
+                    amt = abs(float(raw.get("contracts", raw.get("positionAmt", raw.get("size", 0.0))) or 0.0))
+                    if amt > 0:
+                        return amt
+            return 0.0
+        except Exception as e:
+            logger.critical(f"[{exchange.upper()}][{symbol}] Error fetching actual leg size: {e}")
+            return None
+
     async def _handle_open(self, policy: FRPolicy, dual_pos: DualLegPosition) -> Dict[str, Any]:
         """
         Execute OPEN Action:
         1. Check margin on both exchanges.
         2. Fetch current prices and quantize size.
-        3. Fire dual legs concurrently (BUY Long on ex_long, SELL Short on ex_short).
-        4. Legging Risk Protection: If one leg fails or times out, emergency close the filled leg immediately.
+        3. Fire dual legs concurrently (BUY Long on ex_long, SELL Short on ex_short) with 5s timeout tasks.
+        4. Legging Risk Protection: Cancel on timeout, check actual filled size on exchange, and rollback.
         """
         sym = policy.symbol.strip().upper()
         ex_long = policy.exchange_long.lower()
@@ -133,9 +159,9 @@ class FRExecutionEngine:
 
         logger.info(f"[{sym}] Firing DUAL OPEN orders: qty={target_qty} (Long on {ex_long.upper()}, Short on {ex_short.upper()})")
 
-        # Concurrently fire both legs with 5s timeout
-        try:
-            long_task = self.gateway.create_hedge_order(
+        # Concurrently fire both legs with 5s timeout using separate tasks
+        long_task = asyncio.create_task(
+            self.gateway.create_hedge_order(
                 exchange=ex_long,
                 symbol=sym,
                 side="buy",
@@ -144,7 +170,9 @@ class FRExecutionEngine:
                 order_type="market",
                 client_order_id=cid_long,
             )
-            short_task = self.gateway.create_hedge_order(
+        )
+        short_task = asyncio.create_task(
+            self.gateway.create_hedge_order(
                 exchange=ex_short,
                 symbol=sym,
                 side="sell",
@@ -153,36 +181,113 @@ class FRExecutionEngine:
                 order_type="market",
                 client_order_id=cid_short,
             )
+        )
 
-            results = await asyncio.wait_for(
-                asyncio.gather(long_task, short_task, return_exceptions=True),
-                timeout=5.0,
-            )
-            res_long, res_short = results[0], results[1]
-        except asyncio.TimeoutError:
-            logger.critical(f"[{sym}] DUAL OPEN TIMEOUT (>5s)! Activating Legging Risk Protection...")
-            res_long, res_short = None, None
-        except Exception as e:
-            logger.critical(f"[{sym}] DUAL OPEN EXCEPTION: {e}! Activating Legging Risk Protection...")
-            res_long, res_short = None, None
+        open_timeout = float(getattr(self.risk_config, "order_timeout_sec", 5.0))
+        done, pending = await asyncio.wait(
+            {long_task, short_task},
+            timeout=open_timeout,
+            return_when=asyncio.ALL_COMPLETED,
+        )
 
-        long_ok = (res_long is not None and not isinstance(res_long, Exception))
-        short_ok = (res_short is not None and not isinstance(res_short, Exception))
+        for t in pending:
+            t.cancel()
+            t_cid = cid_long if t == long_task else cid_short
+            t_ex = ex_long if t == long_task else ex_short
+            logger.critical(f"[{sym}] Dual open leg timeout (>5.0s) on {t_ex.upper()}! Cancelled task (cid={t_cid}).")
+
+        res_long = None
+        if long_task in done and not long_task.cancelled():
+            try:
+                res_long = long_task.result()
+            except Exception as e:
+                logger.critical(f"[{sym}] Long leg exception: {e}")
+                res_long = None
+
+        res_short = None
+        if short_task in done and not short_task.cancelled():
+            try:
+                res_short = short_task.result()
+            except Exception as e:
+                logger.critical(f"[{sym}] Short leg exception: {e}")
+                res_short = None
+
+        long_ok = (isinstance(res_long, dict) and not isinstance(res_long, Exception))
+        short_ok = (isinstance(res_short, dict) and not isinstance(res_short, Exception))
 
         # ── LEGGING RISK PROTECTION ROLLBACK ──
         if long_ok and not short_ok:
-            logger.critical(f"[{sym}] LEGGING RISK: Long leg filled on {ex_long.upper()} but Short leg failed on {ex_short.upper()}! Emergency rollback...")
-            rollback_res = await self.gateway.emergency_market_close(ex_long, sym, "LONG", target_qty)
-            dual_pos.status = "FLAT"
-            return {"status": "LEGGING_ROLLBACK", "detail": "Long leg rolled back due to Short leg failure", "rollback": rollback_res is not None}
+            actual_from_exchange = await self._actual_leg_size(ex_long, sym, "LONG")
+            if actual_from_exchange is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_long.upper()} during legging rollback! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_long, f"leg measurement failed on {sym}")
+                return {"status": "MEASUREMENT_FAILED", "exchange": ex_long, "symbol": sym}
+
+            qty_confirmed = float(res_long.get("filled", res_long.get("amount", target_qty)) or target_qty) if long_ok else 0.0
+            actual_qty = max(qty_confirmed, actual_from_exchange)
+            if actual_qty > 0:
+                logger.critical(f"[{sym}] LEGGING RISK: Long leg filled ({actual_qty}) on {ex_long.upper()} but Short leg failed on {ex_short.upper()}! Emergency rollback...")
+                rollback_res = await self.gateway.emergency_market_close(ex_long, sym, "LONG", actual_qty)
+                residual = await self._actual_leg_size(ex_long, sym, "LONG")
+                if residual is None or residual > 1e-5:
+                    logger.critical(f"[{sym}] Residual size after rollback ({residual})! Tripping exchange kill switch.")
+                    self.kill_switch.trip_exchange(ex_long, f"legging rollback residual on {sym}: {residual}")
+                dual_pos.status = "FLAT"
+                return {"status": "LEGGING_ROLLBACK", "detail": "Long leg rolled back due to Short leg failure", "rollback": rollback_res is not None, "actual_qty": actual_qty}
+            else:
+                logger.warning(f"[{sym}] Long leg not filled on exchange. Skipping rollback.")
+                dual_pos.status = "FLAT"
+                return {"status": "BOTH_LEGS_FAILED"}
 
         if short_ok and not long_ok:
-            logger.critical(f"[{sym}] LEGGING RISK: Short leg filled on {ex_short.upper()} but Long leg failed on {ex_long.upper()}! Emergency rollback...")
-            rollback_res = await self.gateway.emergency_market_close(ex_short, sym, "SHORT", target_qty)
-            dual_pos.status = "FLAT"
-            return {"status": "LEGGING_ROLLBACK", "detail": "Short leg rolled back due to Long leg failure", "rollback": rollback_res is not None}
+            actual_from_exchange = await self._actual_leg_size(ex_short, sym, "SHORT")
+            if actual_from_exchange is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_short.upper()} during legging rollback! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_short, f"leg measurement failed on {sym}")
+                return {"status": "MEASUREMENT_FAILED", "exchange": ex_short, "symbol": sym}
+
+            qty_confirmed = float(res_short.get("filled", res_short.get("amount", target_qty)) or target_qty) if short_ok else 0.0
+            actual_qty = max(qty_confirmed, actual_from_exchange)
+            if actual_qty > 0:
+                logger.critical(f"[{sym}] LEGGING RISK: Short leg filled ({actual_qty}) on {ex_short.upper()} but Long leg failed on {ex_long.upper()}! Emergency rollback...")
+                rollback_res = await self.gateway.emergency_market_close(ex_short, sym, "SHORT", actual_qty)
+                residual = await self._actual_leg_size(ex_short, sym, "SHORT")
+                if residual is None or residual > 1e-5:
+                    logger.critical(f"[{sym}] Residual size after rollback ({residual})! Tripping exchange kill switch.")
+                    self.kill_switch.trip_exchange(ex_short, f"legging rollback residual on {sym}: {residual}")
+                dual_pos.status = "FLAT"
+                return {"status": "LEGGING_ROLLBACK", "detail": "Short leg rolled back due to Long leg failure", "rollback": rollback_res is not None, "actual_qty": actual_qty}
+            else:
+                logger.warning(f"[{sym}] Short leg not filled on exchange. Skipping rollback.")
+                dual_pos.status = "FLAT"
+                return {"status": "BOTH_LEGS_FAILED"}
 
         if not long_ok and not short_ok:
+            # Check if ghost-fills occurred despite task timeouts/errors
+            actual_long = await self._actual_leg_size(ex_long, sym, "LONG")
+            actual_short = await self._actual_leg_size(ex_short, sym, "SHORT")
+
+            if actual_long is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_long.upper()}! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_long, f"leg measurement failed on {sym}")
+            elif actual_long > 0:
+                await self.gateway.emergency_market_close(ex_long, sym, "LONG", actual_long)
+                residual = await self._actual_leg_size(ex_long, sym, "LONG")
+                if residual is None or residual > 1e-5:
+                    self.kill_switch.trip_exchange(ex_long, f"legging rollback residual on {sym}: {residual}")
+
+            if actual_short is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_short.upper()}! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_short, f"leg measurement failed on {sym}")
+            elif actual_short > 0:
+                await self.gateway.emergency_market_close(ex_short, sym, "SHORT", actual_short)
+                residual = await self._actual_leg_size(ex_short, sym, "SHORT")
+                if residual is None or residual > 1e-5:
+                    self.kill_switch.trip_exchange(ex_short, f"legging rollback residual on {sym}: {residual}")
+
+            if actual_long is None or actual_short is None:
+                return {"status": "MEASUREMENT_FAILED", "symbol": sym}
+
             logger.error(f"[{sym}] Both legs failed to open.")
             dual_pos.status = "FLAT"
             return {"status": "BOTH_LEGS_FAILED"}
@@ -264,12 +369,32 @@ class FRExecutionEngine:
         long_close = self.gateway.create_hedge_order(ex_long, sym, "sell", "LONG", fmt_qty, order_type="market")
         short_close = self.gateway.create_hedge_order(ex_short, sym, "buy", "SHORT", fmt_qty, order_type="market")
 
-        res_long, res_short = await asyncio.gather(long_close, short_close, return_exceptions=True)
-        dual_pos.long_leg.size = max(0.0, dual_pos.long_leg.size - fmt_qty)
-        dual_pos.short_leg.size = max(0.0, dual_pos.short_leg.size - fmt_qty)
+        results = await asyncio.gather(long_close, short_close, return_exceptions=True)
+        res_long, res_short = results[0], results[1]
+
+        long_reduced = isinstance(res_long, dict) and not isinstance(res_long, Exception)
+        short_reduced = isinstance(res_short, dict) and not isinstance(res_short, Exception)
+
+        if long_reduced:
+            dual_pos.long_leg.size = max(0.0, dual_pos.long_leg.size - fmt_qty)
+        if short_reduced:
+            dual_pos.short_leg.size = max(0.0, dual_pos.short_leg.size - fmt_qty)
+
         dual_pos.recalculate()
 
-        return {"status": "REDUCED", "symbol": sym, "reduced_qty": fmt_qty}
+        if long_reduced and short_reduced:
+            return {"status": "REDUCED", "symbol": sym, "reduced_qty": fmt_qty}
+
+        logger.critical(
+            f"[{sym}] PARTIAL REDUCE: long_reduced={long_reduced}, short_reduced={short_reduced}. Reconcile will handle residual."
+        )
+        return {
+            "status": "REDUCE_PARTIAL",
+            "symbol": sym,
+            "reduced_qty": fmt_qty,
+            "long_reduced": long_reduced,
+            "short_reduced": short_reduced,
+        }
 
     async def _handle_exit(self, policy: FRPolicy, dual_pos: DualLegPosition) -> Dict[str, Any]:
         """
@@ -302,27 +427,48 @@ class FRExecutionEngine:
         else:
             tasks.append(asyncio.sleep(0, result={"skipped": True}))
 
-        res_long, res_short = await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        res_long, res_short = results[0], results[1]
 
-        dual_pos.long_leg.size = 0.0
-        dual_pos.short_leg.size = 0.0
-        dual_pos.status = "FLAT"
+        long_closed = isinstance(res_long, dict) and not isinstance(res_long, Exception)
+        short_closed = isinstance(res_short, dict) and not isinstance(res_short, Exception)
+
+        if long_closed:
+            dual_pos.long_leg.size = 0.0
+        if short_closed:
+            dual_pos.short_leg.size = 0.0
+
         dual_pos.recalculate()
 
-        logger.info(f"[{sym}] Dual-Leg Position EXIT completed. Account is 100% FLAT.")
-        return {"status": "EXIT_COMPLETED", "symbol": sym}
+        if long_closed and short_closed:
+            dual_pos.status = "FLAT"
+            logger.info(f"[{sym}] Dual-Leg Position EXIT completed. Account is 100% FLAT.")
+            return {"status": "EXIT_COMPLETED", "symbol": sym}
+
+        dual_pos.status = "CLOSING"
+        logger.critical(
+            f"[{sym}] PARTIAL EXIT: long_closed={long_closed}, short_closed={short_closed}. Reconcile will handle residual."
+        )
+        return {
+            "status": "EXIT_PARTIAL",
+            "symbol": sym,
+            "long_closed": long_closed,
+            "short_closed": short_closed,
+        }
 
     async def _handle_pause(self, policy: FRPolicy, dual_pos: DualLegPosition) -> Dict[str, Any]:
         """
         Execute PAUSE Action:
-        - Cancel open orders for symbol and pause in kill switch.
+        - Cancel open orders for symbol on the actual leg exchanges and pause in kill switch.
         """
         sym = policy.symbol.strip().upper()
         self.kill_switch.pause_symbol(sym, reason="Policy PAUSE action")
         dual_pos.is_paused = True
-        await self.gateway.cancel_all_orders("binance", sym)
-        await self.gateway.cancel_all_orders("bybit", sym)
-        logger.info(f"[{sym}] Symbol paused and open orders cancelled.")
+        exchanges_to_cancel = {dual_pos.long_leg.exchange.lower(), dual_pos.short_leg.exchange.lower()}
+        for ex in exchanges_to_cancel:
+            if ex:
+                await self.gateway.cancel_all_orders(ex, sym)
+        logger.info(f"[{sym}] Symbol paused and open orders cancelled on {exchanges_to_cancel}.")
         return {"status": "PAUSED", "symbol": sym}
 
     # ── Policy Polling from Decision Layer ──

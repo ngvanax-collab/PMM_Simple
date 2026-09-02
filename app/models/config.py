@@ -166,7 +166,7 @@ class GlobalConfig(BaseModel):
     min_margin_ratio: float = Field(default=1.5, gt=1.0, description="Margin ratio warning threshold (1.5 = 150%)")
     kill_margin_ratio: float = Field(default=1.2, gt=1.0, description="Margin ratio emergency kill threshold (1.2 = 120%)")
     order_budget_per_min: int = Field(default=900, ge=100, description="Global rate limit orders/min")
-    weight_budget_per_min: int = Field(default=1800, ge=100, description="Global rate limit request weight/min")
+    weight_budget_per_min: int = Field(default=2400, ge=100, description="Global rate limit request weight/min")
     position_mode: str = Field(default="hedge", description="Contract position mode: hedge (mandatory)")
     testnet: bool = Field(default=False, description="Use testnet environment")
     reconcile_interval_sec: int = Field(default=60, ge=10, description="Periodic REST reconcile interval in seconds")

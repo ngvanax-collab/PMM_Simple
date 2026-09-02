@@ -96,6 +96,7 @@ class FRRiskConfig(BaseModel):
     decision_layer_url: str = Field(default="http://localhost:8102", description="Decision Layer FastAPI URL")
     poll_interval_sec: float = Field(default=10.0, ge=2.0, le=300.0, description="Policy polling interval in seconds")
     auto_execution_enabled: bool = Field(default=True, description="Enable automatic policy execution")
+    order_timeout_sec: float = Field(default=5.0, ge=0.01, description="Timeout for dual open leg execution in seconds")
 
 
 class FRSummaryMetrics(BaseModel):
