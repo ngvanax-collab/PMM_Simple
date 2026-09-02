@@ -1,5 +1,6 @@
 """Async SQLite Database Layer with WAL Mode."""
 import asyncio
+import time
 from typing import Any, Dict, List, Optional
 import aiosqlite
 import orjson
@@ -120,8 +121,122 @@ class Database:
                 config_json TEXT NOT NULL,
                 timestamp REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS barrier_state (
+                symbol TEXT NOT NULL,
+                position_side TEXT NOT NULL,
+                sl_price REAL NOT NULL DEFAULT 0.0,
+                is_guaranteed_sl_locked INTEGER NOT NULL DEFAULT 0,
+                pyramid_filled_count INTEGER NOT NULL DEFAULT 0,
+                peak_price REAL NOT NULL DEFAULT 0.0,
+                trough_price REAL NOT NULL DEFAULT 0.0,
+                trailing_tp_active INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (symbol, position_side)
+            );
         """)
         await self._conn.commit()
+
+    # ── Barrier State CRUD ──
+    async def save_barrier_state(self, state: Any) -> None:
+        """Insert or replace a barrier state record with lock retry."""
+        if self._conn is None:
+            await self.connect()
+        if self._conn is None:
+            logger.warning("Database not connected, cannot save barrier state.")
+            return
+
+        symbol = state.symbol if hasattr(state, "symbol") else str(state.get("symbol"))
+        pos_side = state.position_side.value if hasattr(state.position_side, "value") else str(state.position_side)
+        sl_price = float(getattr(state, "sl_price", 0.0))
+        is_locked = 1 if getattr(state, "is_guaranteed_sl_locked", False) else 0
+        pyr_count = int(getattr(state, "pyramid_filled_count", 0))
+        peak_price = float(getattr(state, "peak_price", 0.0))
+        trough_val = getattr(state, "trough_price", float("inf"))
+        trough_price = 0.0 if trough_val == float("inf") else float(trough_val)
+        trailing_active = 1 if getattr(state, "trailing_tp_active", False) else 0
+        updated_at = time.time()
+
+        for attempt in range(5):
+            try:
+                async with self._lock:
+                    await self._conn.execute(
+                        """
+                        INSERT INTO barrier_state (
+                            symbol, position_side, sl_price, is_guaranteed_sl_locked,
+                            pyramid_filled_count, peak_price, trough_price, trailing_tp_active, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(symbol, position_side) DO UPDATE SET
+                            sl_price = excluded.sl_price,
+                            is_guaranteed_sl_locked = excluded.is_guaranteed_sl_locked,
+                            pyramid_filled_count = excluded.pyramid_filled_count,
+                            peak_price = excluded.peak_price,
+                            trough_price = excluded.trough_price,
+                            trailing_tp_active = excluded.trailing_tp_active,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            symbol,
+                            pos_side,
+                            sl_price,
+                            is_locked,
+                            pyr_count,
+                            peak_price,
+                            trough_price,
+                            trailing_active,
+                            updated_at,
+                        )
+                    )
+                    await self._conn.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 4:
+                    await asyncio.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.warning(f"Failed to save barrier state for {symbol} {pos_side}: {e}")
+                return
+
+    async def load_barrier_state(self, symbol: str, position_side: Any) -> Optional[Dict[str, Any]]:
+        """Load persisted barrier state for symbol and position_side."""
+        if self._conn is None:
+            await self.connect()
+        if self._conn is None:
+            return None
+
+        pos_side = position_side.value if hasattr(position_side, "value") else str(position_side)
+        async with self._lock:
+            async with self._conn.execute(
+                "SELECT * FROM barrier_state WHERE symbol = ? AND position_side = ?",
+                (symbol, pos_side)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return dict(row)
+        return None
+
+    async def delete_barrier_state(self, symbol: str, position_side: Any) -> None:
+        """Delete persisted barrier state upon full position close."""
+        if self._conn is None:
+            await self.connect()
+        if self._conn is None:
+            return
+
+        pos_side = position_side.value if hasattr(position_side, "value") else str(position_side)
+        for attempt in range(5):
+            try:
+                async with self._lock:
+                    await self._conn.execute(
+                        "DELETE FROM barrier_state WHERE symbol = ? AND position_side = ?",
+                        (symbol, pos_side)
+                    )
+                    await self._conn.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 4:
+                    await asyncio.sleep(0.05 * (attempt + 1))
+                    continue
+                logger.warning(f"Failed to delete barrier state for {symbol} {pos_side}: {e}")
+                return
 
     # ── Orders CRUD ──
     async def save_order(self, order: OrderRecord) -> None:

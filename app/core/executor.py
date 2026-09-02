@@ -32,6 +32,7 @@ class TripleBarrierExecutor:
         gateway: ExchangeGateway,
         position_tracker: PositionTracker,
         quoter: PMMQuoter,
+        on_isolated_kill: Optional[Any] = None,
     ):
         self.config = config
         self.position_side = position_side
@@ -39,6 +40,7 @@ class TripleBarrierExecutor:
         self.gateway = gateway
         self.tracker = position_tracker
         self.quoter = quoter
+        self._on_isolated_kill = on_isolated_kill
 
         self.state = ExecutorBarrierState(
             symbol=self.symbol,
@@ -107,6 +109,11 @@ class TripleBarrierExecutor:
                     f"(Init={init_p:.4f}, Avg={self.state.entry_price:.4f}, s_floor={s_floor*100:.3f}%). Tightened callback={self._trailing_cb_override*100:.2f}%."
                 )
 
+                try:
+                    await db.save_barrier_state(self.state)
+                except Exception as e:
+                    logger.warning(f"[{self.symbol}] Failed to save barrier state: {e}")
+
                 await self._place_take_profit_orders()
                 return
 
@@ -151,8 +158,10 @@ class TripleBarrierExecutor:
     async def reconcile_barrier(self, current_mark_price: float = 0.0) -> None:
         """
         Reconcile and restore barrier protection on bot startup or periodic exchange reconcile.
-        1. If position == 0: Clean up any stale barrier orders and deactivate barrier.
+        1. If position == 0: Clean up any stale barrier orders, deactivate barrier, delete persisted state.
         2. If position > 0:
+           - Fail-closed: If entry_price <= 0, log CRITICAL and trigger isolated kill.
+           - Check persisted barrier state (restore Guaranteed SL and pyramiding state if saved).
            - Arm barrier (active = True, entry_price, total_qty, remaining_qty).
            - Check overflow / breached state against mark price:
              * If Virtual SL breached: Execute emergency MARKET exit with purpose=STOP_LOSS.
@@ -167,6 +176,23 @@ class TripleBarrierExecutor:
                     await self._cleanup_all_barrier_orders()
                     self.state.active = False
                     self._is_exiting = False
+                    self.state.pyramid_filled_count = 0
+                    self.state.is_guaranteed_sl_locked = False
+                    self._trailing_cb_override = None
+                try:
+                    await db.delete_barrier_state(self.symbol, self.position_side)
+                except Exception as e:
+                    logger.debug(f"[{self.symbol}] Non-fatal error deleting barrier state: {e}")
+                return
+
+            # ── Fail-Closed Check: If position > 0 but entry_price <= 0 from exchange ──
+            if pos_state.entry_price <= 0:
+                logger.critical(
+                    f"[{self.symbol}][{self.position_side.value}] Invalid entry_price ({pos_state.entry_price}) "
+                    f"from exchange while position is open ({pos_state.amount:.4f})! Triggering isolated kill."
+                )
+                if self._on_isolated_kill:
+                    await self._on_isolated_kill("entry_price invalid from exchange")
                 return
 
             # Position exists on exchange -> Arm barrier state
@@ -179,12 +205,46 @@ class TripleBarrierExecutor:
                 self.state.entry_timestamp = time.time()
             self.state.last_update_time = time.time()
 
-            # Calculate Virtual SL trigger price
-            if self.position_side == PositionSide.LONG:
-                raw_sl_price = self.state.entry_price * (1.0 - self.config.stop_loss)
+            # Check persisted barrier state
+            saved = None
+            try:
+                saved = await db.load_barrier_state(self.symbol, self.position_side)
+            except Exception as e:
+                logger.warning(f"[{self.symbol}][{self.position_side.value}] Could not load persisted barrier state: {e}")
+
+            if saved and bool(saved.get("is_guaranteed_sl_locked", 0)):
+                saved_sl = float(saved.get("sl_price", 0.0))
+                # Verify if saved sl is still valid relative to mark
+                is_valid_sl = False
+                if self.position_side == PositionSide.LONG:
+                    is_valid_sl = (current_mark_price <= 0 or saved_sl < current_mark_price)
+                else:
+                    is_valid_sl = (current_mark_price <= 0 or saved_sl > current_mark_price)
+
+                if is_valid_sl and saved_sl > 0:
+                    self.state.sl_price = saved_sl
+                    self.state.is_guaranteed_sl_locked = True
+                    self.state.pyramid_filled_count = int(saved.get("pyramid_filled_count", 1))
+                    self.state.peak_price = float(saved.get("peak_price", 0.0))
+                    self.state.trough_price = float(saved.get("trough_price", 0.0))
+                    self.state.trailing_tp_active = bool(saved.get("trailing_tp_active", 0))
+                    tp_base = getattr(self.config, "take_profit", 0.008)
+                    self._trailing_cb_override = max(0.0020, 0.20 * tp_base)
+                    logger.info(
+                        f"[{self.symbol}][{self.position_side.value}][GUARANTEED_SL] Restored locked Guaranteed SL from DB: "
+                        f"sl_price={self.state.sl_price:.4f}, pyramid_count={self.state.pyramid_filled_count}"
+                    )
+                else:
+                    self.state.sl_price = saved_sl
+                    self.state.is_guaranteed_sl_locked = True
             else:
-                raw_sl_price = self.state.entry_price * (1.0 + self.config.stop_loss)
-            self.state.sl_price = self.quoter.quantize_price(raw_sl_price)
+                # Calculate Virtual SL trigger price
+                if self.position_side == PositionSide.LONG:
+                    raw_sl_price = self.state.entry_price * (1.0 - self.config.stop_loss)
+                else:
+                    raw_sl_price = self.state.entry_price * (1.0 + self.config.stop_loss)
+                self.state.sl_price = self.quoter.quantize_price(raw_sl_price)
+
             self.state.sl_qty = self.quoter.quantize_amount(self.state.remaining_qty)
 
             logger.info(
@@ -312,6 +372,10 @@ class TripleBarrierExecutor:
                 pos_state = self.tracker.get_state(self.position_side)
                 pos_state.pyramid_filled_count = 0
                 pos_state.is_guaranteed_sl_locked = False
+                try:
+                    await db.delete_barrier_state(self.symbol, self.position_side)
+                except Exception as e:
+                    logger.debug(f"[{self.symbol}] Non-fatal error deleting barrier state on exit: {e}")
                 return
 
             # Partial exit: Re-place TP orders for remaining quantity to protect position
@@ -571,6 +635,10 @@ class TripleBarrierExecutor:
                         logger.info(
                             f"[{self.symbol}][LONG][TRAILING_TP_ACTIVE] Trailing TP activated at price {current_price:.4f} (>= {act_price:.4f})"
                         )
+                        try:
+                            await db.save_barrier_state(self.state)
+                        except Exception as e:
+                            logger.debug(f"[{self.symbol}] Non-fatal error saving barrier state: {e}")
 
                     if self.state.trailing_tp_active:
                         self.state.peak_price = max(self.state.peak_price, current_price)
@@ -592,6 +660,10 @@ class TripleBarrierExecutor:
                         logger.info(
                             f"[{self.symbol}][SHORT][TRAILING_TP_ACTIVE] Trailing TP activated at price {current_price:.4f} (<= {act_price:.4f})"
                         )
+                        try:
+                            await db.save_barrier_state(self.state)
+                        except Exception as e:
+                            logger.debug(f"[{self.symbol}] Non-fatal error saving barrier state: {e}")
 
                     if self.state.trailing_tp_active:
                         if self.state.trough_price == float('inf') or self.state.trough_price <= 0 or current_price < self.state.trough_price:

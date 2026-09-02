@@ -7,6 +7,15 @@ from app.models.config import GlobalConfig, PairConfig
 from app.persistence.db import db
 
 
+def utc_day_start(now: float) -> float:
+    """
+    Calculate 00:00:00 UTC epoch timestamp for the given unix timestamp.
+    Người vận hành ở UTC+7 lưu ý: ngày rủi ro kết thúc 07:00 sáng giờ VN, khớp
+    kỳ reset funding/PnL ngày của sàn.
+    """
+    return now - (now % 86400)
+
+
 class CircuitBreaker:
     """Monitors daily loss limits and gross margin ratios to protect account capital."""
 
@@ -16,6 +25,7 @@ class CircuitBreaker:
         self._trip_reason: str = ""
         self._trip_time: float = 0.0
         self._reset_timestamp: float = 0.0
+        self._last_day_boundary: float = utc_day_start(time.time())
 
     @property
     def is_tripped(self) -> bool:
@@ -47,13 +57,16 @@ class CircuitBreaker:
         if self._tripped:
             return True, self._trip_reason
 
-        # ── 1. Daily Realized Loss Check ──
-        # Calculate daily loss from midnight UTC or since last manual reset
         now = time.time()
-        start_of_day = now - (now % 86400)
+        start_of_day = utc_day_start(now)
+        if start_of_day > self._last_day_boundary:
+            logger.info(f"[CIRCUIT_BREAKER] UTC Day boundary crossed (00:00:00 UTC). Resetting daily tracking window to {start_of_day:.0f}.")
+            self._last_day_boundary = start_of_day
+
+        # ── 1. Daily Realized Loss Check ──
         since_ts = max(start_of_day, self._reset_timestamp)
         pnl_summary = await db.get_pnl_summary(since_timestamp=since_ts)
-        net_daily_pnl = pnl_summary.get("total_net_pnl", 0.0)
+        net_daily_pnl = float(pnl_summary.get("total_net_pnl", 0.0) or 0.0)
 
         # Only trip if daily loss limit is configured (> 0) and net loss is negative exceeding the threshold
         limit_usdt = self.global_config.account_daily_loss_limit_usdt
@@ -65,7 +78,6 @@ class CircuitBreaker:
             return True, self._trip_reason
 
         # ── 2. Gross Margin Ratio Check ──
-        # Only check margin ratio if there are active positions with maintenance margin > 0
         if (
             total_maintenance_margin is not None and total_maintenance_margin > 0 and
             total_account_balance is not None and total_account_balance > 0
@@ -87,11 +99,11 @@ class CircuitBreaker:
     async def check_pair_loss(self, config: PairConfig) -> Tuple[bool, str]:
         """Check if a specific pair has exceeded its individual daily loss limit."""
         now = time.time()
-        start_of_day = now - (now % 86400)
+        start_of_day = utc_day_start(now)
         since_ts = max(start_of_day, self._reset_timestamp)
         pnl_summary = await db.get_pnl_summary(symbol=config.symbol, since_timestamp=since_ts)
         
-        realized_pnl = pnl_summary.get("total_net_pnl", pnl_summary.get("total_realized_pnl", 0.0))
+        realized_pnl = float(pnl_summary.get("total_net_pnl", pnl_summary.get("total_realized_pnl", 0.0)) or 0.0)
         max_daily_loss = getattr(config, "max_daily_loss_usdt", getattr(config, "daily_loss_limit_usdt", getattr(config, "max_loss_usdt", 0.0)))
 
         if max_daily_loss > 0 and realized_pnl < 0 and abs(realized_pnl) >= max_daily_loss:
