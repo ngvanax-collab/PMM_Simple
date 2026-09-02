@@ -13,6 +13,7 @@ class FRPositionTracker:
         self.positions: Dict[str, DualLegPosition] = {}  # symbol -> DualLegPosition
         self.realized_funding_pnl: float = 0.0
         self.last_reconciled_at: float = 0.0
+        self.processed_funding_ids: set = set()  # Deduplicate real funding transactions (TASK L-2)
 
     @staticmethod
     def _canon(symbol: str) -> str:
@@ -132,16 +133,48 @@ class FRPositionTracker:
         dual_pos.recalculate()
         return dual_pos
 
-    def record_funding_payment(self, symbol: str, exchange: str, position_side: str, payment_amount: float) -> None:
-        """Record funding fee received (+) or paid (-)."""
+    def record_funding_payment(
+        self,
+        symbol: str,
+        exchange: str,
+        position_side: str = "LONG",
+        payment_amount: float = 0.0,
+        amount: Optional[float] = None,
+        funding_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """
+        Record real funding payment deduplicated by transaction ID (TASK L-2).
+        Supports both direct amount tracking and transaction deduplication.
+        """
+        eff_amount = amount if amount is not None else payment_amount
+        ts = timestamp if timestamp is not None else time.time()
+        fid = funding_id or f"funding_{exchange}_{symbol}_{position_side}_{ts}_{eff_amount}"
+
+        if fid in self.processed_funding_ids:
+            return False
+        self.processed_funding_ids.add(fid)
+        if len(self.processed_funding_ids) > 2000:
+            self.processed_funding_ids = set(list(self.processed_funding_ids)[-1000:])
+
         sym = self._canon(symbol)
-        dual_pos = self.get_or_create_position(sym)
-        pos_side = position_side.upper()
-        leg = dual_pos.long_leg if pos_side == "LONG" else dual_pos.short_leg
-        leg.funding_accrued += payment_amount
-        self.realized_funding_pnl += payment_amount
-        dual_pos.recalculate()
-        logger.info(f"[{sym}] Recorded funding payment {payment_amount:+.4f} USDT on {exchange.upper()} ({pos_side})")
+        if sym in self.positions:
+            pos = self.positions[sym]
+            ex = exchange.lower()
+            side_upper = str(position_side).upper()
+            if pos.long_leg.exchange == ex and (side_upper == "LONG" or pos.short_leg.exchange != ex):
+                pos.long_leg.funding_accrued += eff_amount
+                pos.long_leg.last_updated = ts
+            elif pos.short_leg.exchange == ex and (side_upper == "SHORT" or pos.long_leg.exchange != ex):
+                pos.short_leg.funding_accrued += eff_amount
+                pos.short_leg.last_updated = ts
+            else:
+                pos.total_funding_accrued += eff_amount
+            pos.recalculate()
+
+        self.realized_funding_pnl += eff_amount
+        logger.info(f"[{exchange.upper()}][{sym}] Recorded funding payment: ${eff_amount:+.4f} (ID: {fid})")
+        return True
 
     def reconcile_with_exchange_positions(
         self,

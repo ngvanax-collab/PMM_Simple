@@ -76,10 +76,11 @@ class FRExecutionEngine:
 
     # ── Action Handlers ──
 
-    async def _actual_leg_size(self, exchange: str, symbol: str, position_side: str) -> float:
+    async def _actual_leg_size(self, exchange: str, symbol: str, position_side: str) -> Optional[float]:
         """
         Query actual live position size from exchange for a specific leg side.
         Parses contracts | positionAmt | size (absolute value).
+        Returns None if fetch failed (fail-closed), 0.0 if fetch succeeded and no position.
         """
         try:
             raw_positions = await self.gateway.fetch_positions(exchange, symbols=[symbol])
@@ -98,8 +99,8 @@ class FRExecutionEngine:
                         return amt
             return 0.0
         except Exception as e:
-            logger.error(f"[{exchange.upper()}][{symbol}] Error fetching actual leg size: {e}")
-            return 0.0
+            logger.critical(f"[{exchange.upper()}][{symbol}] Error fetching actual leg size: {e}")
+            return None
 
     async def _handle_open(self, policy: FRPolicy, dual_pos: DualLegPosition) -> Dict[str, Any]:
         """
@@ -217,13 +218,18 @@ class FRExecutionEngine:
         # ── LEGGING RISK PROTECTION ROLLBACK ──
         if long_ok and not short_ok:
             actual_from_exchange = await self._actual_leg_size(ex_long, sym, "LONG")
+            if actual_from_exchange is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_long.upper()} during legging rollback! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_long, f"leg measurement failed on {sym}")
+                return {"status": "MEASUREMENT_FAILED", "exchange": ex_long, "symbol": sym}
+
             qty_confirmed = float(res_long.get("filled", res_long.get("amount", target_qty)) or target_qty) if long_ok else 0.0
             actual_qty = max(qty_confirmed, actual_from_exchange)
             if actual_qty > 0:
                 logger.critical(f"[{sym}] LEGGING RISK: Long leg filled ({actual_qty}) on {ex_long.upper()} but Short leg failed on {ex_short.upper()}! Emergency rollback...")
                 rollback_res = await self.gateway.emergency_market_close(ex_long, sym, "LONG", actual_qty)
                 residual = await self._actual_leg_size(ex_long, sym, "LONG")
-                if residual > 1e-5:
+                if residual is None or residual > 1e-5:
                     logger.critical(f"[{sym}] Residual size after rollback ({residual})! Tripping exchange kill switch.")
                     self.kill_switch.trip_exchange(ex_long, f"legging rollback residual on {sym}: {residual}")
                 dual_pos.status = "FLAT"
@@ -235,13 +241,18 @@ class FRExecutionEngine:
 
         if short_ok and not long_ok:
             actual_from_exchange = await self._actual_leg_size(ex_short, sym, "SHORT")
+            if actual_from_exchange is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_short.upper()} during legging rollback! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_short, f"leg measurement failed on {sym}")
+                return {"status": "MEASUREMENT_FAILED", "exchange": ex_short, "symbol": sym}
+
             qty_confirmed = float(res_short.get("filled", res_short.get("amount", target_qty)) or target_qty) if short_ok else 0.0
             actual_qty = max(qty_confirmed, actual_from_exchange)
             if actual_qty > 0:
                 logger.critical(f"[{sym}] LEGGING RISK: Short leg filled ({actual_qty}) on {ex_short.upper()} but Long leg failed on {ex_long.upper()}! Emergency rollback...")
                 rollback_res = await self.gateway.emergency_market_close(ex_short, sym, "SHORT", actual_qty)
                 residual = await self._actual_leg_size(ex_short, sym, "SHORT")
-                if residual > 1e-5:
+                if residual is None or residual > 1e-5:
                     logger.critical(f"[{sym}] Residual size after rollback ({residual})! Tripping exchange kill switch.")
                     self.kill_switch.trip_exchange(ex_short, f"legging rollback residual on {sym}: {residual}")
                 dual_pos.status = "FLAT"
@@ -255,16 +266,28 @@ class FRExecutionEngine:
             # Check if ghost-fills occurred despite task timeouts/errors
             actual_long = await self._actual_leg_size(ex_long, sym, "LONG")
             actual_short = await self._actual_leg_size(ex_short, sym, "SHORT")
-            if actual_long > 0:
+
+            if actual_long is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_long.upper()}! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_long, f"leg measurement failed on {sym}")
+            elif actual_long > 0:
                 await self.gateway.emergency_market_close(ex_long, sym, "LONG", actual_long)
                 residual = await self._actual_leg_size(ex_long, sym, "LONG")
-                if residual > 1e-5:
+                if residual is None or residual > 1e-5:
                     self.kill_switch.trip_exchange(ex_long, f"legging rollback residual on {sym}: {residual}")
-            if actual_short > 0:
+
+            if actual_short is None:
+                logger.critical(f"[{sym}] Measurement failed on {ex_short.upper()}! Tripping kill switch.")
+                self.kill_switch.trip_exchange(ex_short, f"leg measurement failed on {sym}")
+            elif actual_short > 0:
                 await self.gateway.emergency_market_close(ex_short, sym, "SHORT", actual_short)
                 residual = await self._actual_leg_size(ex_short, sym, "SHORT")
-                if residual > 1e-5:
+                if residual is None or residual > 1e-5:
                     self.kill_switch.trip_exchange(ex_short, f"legging rollback residual on {sym}: {residual}")
+
+            if actual_long is None or actual_short is None:
+                return {"status": "MEASUREMENT_FAILED", "symbol": sym}
+
             logger.error(f"[{sym}] Both legs failed to open.")
             dual_pos.status = "FLAT"
             return {"status": "BOTH_LEGS_FAILED"}
