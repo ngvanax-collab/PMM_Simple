@@ -97,15 +97,20 @@ class BotManager:
             asyncio.create_task(_safe_fill_cb())
 
     def _handle_position_update(self, symbol: str, pos_side: PositionSide, amount: float, entry_p: float, upnl: float) -> None:
-        """Dispatch position update with error isolation."""
+        """Dispatch position update with error isolation and async lock safety."""
         if symbol in self.workers:
-            try:
-                state = self.workers[symbol].tracker.get_state(pos_side)
-                state.amount = amount
-                state.entry_price = entry_p
-                state.unrealized_pnl = upnl
-            except Exception as e:
-                logger.error(f"[{symbol}] Exception in _handle_position_update: {e}")
+            async def _safe_pos_cb():
+                try:
+                    worker = self.workers[symbol]
+                    async with worker._lock:
+                        state = worker.tracker.get_state(pos_side)
+                        state.amount = amount
+                        state.entry_price = entry_p
+                        state.unrealized_pnl = upnl
+                        state.last_fill_time = max(state.last_fill_time, time.time())
+                except Exception as e:
+                    logger.error(f"[{symbol}] Exception in _handle_position_update: {e}")
+            asyncio.create_task(_safe_pos_cb())
 
     # ── Worker Management ──
 

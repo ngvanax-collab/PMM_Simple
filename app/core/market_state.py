@@ -69,9 +69,19 @@ class MarketState:
         self.last_atr_1h: float = 0.0
 
     def update_natr_15m(self, natr: float) -> None:
-        """Update 15m NATR for dynamic circuit breaker thresholding."""
-        # Normalize if passed as percentage (e.g. 1.4%) vs decimal (0.014)
-        self.current_natr_15m = natr / 100.0 if natr > 0.1 else natr
+        """
+        Update 15m NATR for dynamic circuit breaker thresholding.
+        Contract: natr must be a DECIMAL representation (e.g. 0.012 = 1.2%, 0.005 = 0.5%).
+        Valid range: [0.0001, 0.20]. Out of bounds values are rejected with a warning.
+        """
+        if not (0.0001 <= natr <= 0.20):
+            logger.warning(
+                f"[{self.symbol}][NATR_VALIDATION] Rejected invalid NATR 15m decimal value: {natr}. "
+                f"Must be within [0.0001, 0.20]. Retaining existing value: {self.current_natr_15m}."
+            )
+            return
+
+        self.current_natr_15m = float(natr)
         thresh = self.get_circuit_breaker_threshold()
         logger.info(
             f"[{self.symbol}][VAMM_15M_UPDATE] Updated NATR 15m = {self.current_natr_15m*100:.2f}% "

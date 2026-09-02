@@ -137,6 +137,7 @@ class ExecutorBarrierState(BaseModel):
     passive_exit_active: bool = Field(default=False, description="Whether passive maker time-limit exit is currently open")
     passive_exit_order_id: Optional[str] = Field(default=None, description="Order ID of active passive maker exit order")
     passive_exit_start_time: float = Field(default=0.0, description="When passive maker exit was initiated")
+    passive_exit_refresh_count: int = Field(default=0, ge=0, description="Number of times passive maker exit was refreshed")
     entry_timestamp: float = Field(default=0.0, description="When position was opened")
     last_update_time: float = Field(default=0.0, description="Last update timestamp")
     filled_levels_count: int = Field(default=0, ge=0, description="Number of levels filled in current position cycle")

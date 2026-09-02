@@ -362,6 +362,7 @@ class TripleBarrierExecutor:
                 self.state.passive_exit_active = False
                 self.state.passive_exit_order_id = None
                 self.state.passive_exit_start_time = 0.0
+                self.state.passive_exit_refresh_count = 0
                 self.state.pyramid_filled_count = 0
                 self.state.is_guaranteed_sl_locked = False
                 self.state.initial_entry_price = 0.0
@@ -377,6 +378,16 @@ class TripleBarrierExecutor:
                 except Exception as e:
                     logger.debug(f"[{self.symbol}] Non-fatal error deleting barrier state on exit: {e}")
                 return
+
+            # Partial exit: Cancel passive exit if active before placing new TP orders (TASK M-1)
+            if self.state.passive_exit_active and self.state.passive_exit_order_id:
+                logger.info(
+                    f"[{self.symbol}][{self.position_side.value}][PASSIVE_EXIT] Cancelling passive exit order "
+                    f"({self.state.passive_exit_order_id}) prior to TP replenishment."
+                )
+                await self.gateway.cancel_order(self.symbol, self.state.passive_exit_order_id)
+                self.state.passive_exit_order_id = None
+                self.state.passive_exit_active = False
 
             # Partial exit: Re-place TP orders for remaining quantity to protect position
             logger.info(
@@ -746,10 +757,21 @@ class TripleBarrierExecutor:
         if self.state.passive_exit_active:
             # Order is already placed; check if timeout expired to refresh price
             if now - self.state.passive_exit_start_time >= timeout_sec:
+                self.state.passive_exit_refresh_count = getattr(self.state, "passive_exit_refresh_count", 0) + 1
                 if self.state.passive_exit_order_id:
                     await self.gateway.cancel_order(self.symbol, self.state.passive_exit_order_id)
                     self.state.passive_exit_order_id = None
                 self.state.passive_exit_active = False
+
+                # Escalation: after 2 refresh cycles without filling, escalate to immediate MARKET exit (TASK M-3)
+                if self.state.passive_exit_refresh_count >= 2:
+                    logger.critical(
+                        f"[{self.symbol}][{self.position_side.value}][PASSIVE_EXIT_ESCALATION] Passive exit failed to fill "
+                        f"after {self.state.passive_exit_refresh_count} cycles. Escalating to MARKET exit."
+                    )
+                    self.state.passive_exit_refresh_count = 0
+                    await self._execute_market_exit(purpose=OrderPurpose.TIME_LIMIT_EXIT)
+                    return
             else:
                 return
 

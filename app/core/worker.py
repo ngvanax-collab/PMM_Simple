@@ -7,7 +7,7 @@ from loguru import logger
 from app.core.circuit_breaker import utc_day_start
 from app.core.executor import TripleBarrierExecutor
 from app.core.gateway import ExchangeGateway
-from app.core.market_state import MarketState
+from app.core.market_state import MarketState, calculate_atr_from_candles
 from app.core.position_tracker import PositionTracker
 from app.core.quoter import PMMQuoter, QuoteLevel
 from app.models.config import PairConfig
@@ -193,12 +193,16 @@ class PMMWorker:
         self._running = True
         self._paused = False
 
+        # Reset 60s sliding window on start (TASK CB-5)
+        self.market_state.price_history_60s.clear()
+
         # Launch public WS ticker stream for realtime top-of-book updates
         if hasattr(self.gateway, "watch_public_ticker"):
             self._ws_ticker_task = self._create_background_task(
                 self.gateway.watch_public_ticker(
                     self.symbol,
-                    lambda bid, ask, mark: self._create_background_task(self.on_ticker_update(bid, ask, mark))
+                    lambda bid, ask, mark: self._create_background_task(self.on_ticker_update(bid, ask, mark)),
+                    on_reconnect=lambda: self.market_state.price_history_60s.clear(),
                 )
             )
 
@@ -354,8 +358,8 @@ class PMMWorker:
 
         if is_tripped:
             was_active = self.market_state.is_circuit_breaker_active(now)
-            self.market_state.circuit_breaker_paused_until = now + pause_sec
             if not was_active:
+                self.market_state.circuit_breaker_paused_until = now + pause_sec
                 logger.warning(
                     f"[{self.symbol}][CIRCUIT_BREAKER_TRIGGERED][DYNAMIC] {self.symbol} spike: "
                     f"delta={delta_60s*100:.2f}% >= threshold={threshold*100:.2f}% (NATR_15m={self.market_state.current_natr_15m*100:.2f}%). "
@@ -492,6 +496,7 @@ class PMMWorker:
         """Main loop checking market sanity, refresh timers, hanging orders, and reconcile."""
         last_reconcile = time.time()
         last_trend_check = time.time()
+        last_natr_15m_check = 0.0
         last_sanity_warning = 0.0
 
         while self._running:
@@ -535,6 +540,20 @@ class PMMWorker:
                                 last_trend_check = now
                         except Exception as e:
                             logger.warning(f"[{self.symbol}] Periodic trend bias update note: {e}")
+
+                # ── Periodic 15m NATR Anchor Refresh (TASK CB-1) ──
+                if hasattr(self.gateway, "fetch_ohlcv") and (now - last_natr_15m_check >= 300.0):
+                    try:
+                        candles_15m = await self.gateway.fetch_ohlcv(self.symbol, timeframe="15m", limit=20)
+                        if candles_15m and len(candles_15m) >= 2:
+                            atr_15m = calculate_atr_from_candles(candles_15m, period=14)
+                            last_close = float(candles_15m[-1][4])
+                            if last_close > 0 and atr_15m > 0:
+                                natr_decimal = atr_15m / last_close
+                                self.market_state.update_natr_15m(natr_decimal)
+                                last_natr_15m_check = now
+                    except Exception as e:
+                        logger.warning(f"[{self.symbol}] Periodic 15m NATR refresh note: {e}")
 
                 # 3. Check if requote is triggered
                 should_requote, reason = self._check_should_requote()

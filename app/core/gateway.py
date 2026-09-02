@@ -660,7 +660,37 @@ class ExchangeGateway:
             logger.error(f"[{symbol}] Failed to fetch ticker/orderbook: {e}")
             return None
 
-    async def watch_public_ticker(self, symbol: str, on_update: Callable[[float, float, float], Any]) -> None:
+    async def fetch_orderbook_depth_snapshot(self, symbol: str, pct: float = 0.01) -> float:
+        """Fetch orderbook depth within +/- pct of mid price guarded by rate limiter (TASK M-6)."""
+        if not self._exchange:
+            return 0.0
+        await rate_limiter.acquire_weight(weight=2)
+        try:
+            ob = await self._exchange.fetch_order_book(symbol, limit=50)
+            bids = ob.get("bids") or []
+            asks = ob.get("asks") or []
+            if not bids or not asks:
+                return 0.0
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mid = (best_bid + best_ask) / 2.0
+            if mid <= 0:
+                return 0.0
+            min_bid = mid * (1.0 - pct)
+            max_ask = mid * (1.0 + pct)
+            b_depth = sum(float(p) * float(q) for p, q in bids if float(p) >= min_bid)
+            a_depth = sum(float(p) * float(q) for p, q in asks if float(p) <= max_ask)
+            return float(b_depth + a_depth)
+        except Exception as e:
+            logger.warning(f"[{symbol}] Failed to fetch orderbook depth snapshot: {e}")
+            return 0.0
+
+    async def watch_public_ticker(
+        self,
+        symbol: str,
+        on_update: Callable[[float, float, float], Any],
+        on_reconnect: Optional[Callable[[], Any]] = None,
+    ) -> None:
         """Continuously watch public ticker or orderbook for a symbol via WebSocket."""
         while self._running and self._exchange:
             try:
@@ -692,6 +722,13 @@ class ExchangeGateway:
             except Exception as e:
                 if self._running:
                     logger.warning(f"[{symbol}] Public WS watch_ticker exception (reconnecting in 2s): {e}")
+                    if on_reconnect:
+                        try:
+                            rec_res = on_reconnect()
+                            if asyncio.iscoroutine(rec_res):
+                                await rec_res
+                        except Exception as rec_err:
+                            logger.warning(f"[{symbol}] on_reconnect callback error: {rec_err}")
                     await asyncio.sleep(2.0)
 
     # ── Precision & Filter Helpers ──

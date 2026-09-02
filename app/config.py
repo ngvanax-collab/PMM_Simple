@@ -25,11 +25,11 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 class AppSettings(BaseSettings):
     """Environment configuration settings."""
-    app_env: str = "production"
-    log_level: str = "INFO"
+    app_env: str = os.getenv("APP_ENV", "production")
+    log_level: str = os.getenv("LOG_LEVEL", "INFO")
     web_host: str = "0.0.0.0"
     web_port: int = 8502
-    secret_key: str = "pmm-super-secret-master-key-hedge-v3-change-in-prod"
+    secret_key: str = os.getenv("SECRET_KEY", "")
     default_exchange: str = "binance"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -37,7 +37,7 @@ class AppSettings(BaseSettings):
 
 settings = AppSettings()
 
-# Configure Loguru logger
+# Configure Loguru logger with non-blocking enqueue (TASK L-3)
 logger.add(
     LOGS_DIR / "pmm_engine_{time:YYYY-MM-DD}.log",
     rotation="50 MB",
@@ -46,12 +46,26 @@ logger.add(
     format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
     backtrace=True,
     diagnose=True,
+    enqueue=True,
 )
 
 
 def _get_fernet() -> Fernet:
-    """Generate deterministic Fernet key from master secret."""
-    key = hashlib.sha256(settings.secret_key.encode("utf-8")).digest()
+    """
+    Generate deterministic Fernet key from master secret (TASK M-8).
+    In production mode, SECRET_KEY is mandatory and missing key raises RuntimeError.
+    """
+    secret = settings.secret_key
+    if not secret:
+        if settings.app_env == "production":
+            raise RuntimeError("FATAL: SECRET_KEY environment variable is mandatory in production mode!")
+        logger.warning(
+            "[SECURITY] SECRET_KEY not set in environment. Using temporary dev fallback key. "
+            "Set SECRET_KEY in production!"
+        )
+        secret = "pmm-dev-fallback-key-do-not-use-in-production"
+
+    key = hashlib.sha256(secret.encode("utf-8")).digest()
     fernet_key = base64.urlsafe_b64encode(key)
     return Fernet(fernet_key)
 

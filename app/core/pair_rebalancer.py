@@ -225,10 +225,11 @@ class PairRebalancer:
                         if isinstance(ex_name, str) and ex_name:
                             exchange_val = ex_name
 
+                    per_pair_margin = self.config.total_margin_budget_usdt / max(1, self.config.max_active_pairs)
                     # Compute VAMM Dynamic Parameters based on cand.natr_14
                     vamm_params = compute_vamm_parameters(
                         natr_pct=cand.natr_14 if cand.natr_14 > 0 else 1.2,
-                        allocated_margin=21.0,
+                        allocated_margin=per_pair_margin,
                         leverage=5,
                         order_levels=3,
                     )
@@ -320,8 +321,6 @@ class PairRebalancer:
                     if success:
                         summary["added_pairs"].append(cand.symbol)
                         available_slots -= 1
-                        if hasattr(bot_manager, "workers") and cand.symbol in bot_manager.workers:
-                            bot_manager.workers[cand.symbol].market_state.update_natr_15m(cand.natr_14 if cand.natr_14 > 0 else 1.2)
                         self.add_event(
                             action="ADD",
                             symbol=cand.symbol,
