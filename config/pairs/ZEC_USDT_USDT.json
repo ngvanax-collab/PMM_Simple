@@ -1,7 +1,7 @@
 {
   "symbol": "ZEC/USDT:USDT",
   "exchange": "binance",
-  "enabled": true,
+  "enabled": false,
   "leverage": 5,
   "margin_mode": "isolated",
   "order_amount_usdt": 30.0,

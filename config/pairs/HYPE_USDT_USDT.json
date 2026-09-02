@@ -1,15 +1,15 @@
 {
   "symbol": "HYPE/USDT:USDT",
   "exchange": "binance",
-  "enabled": true,
+  "enabled": false,
   "leverage": 5,
   "margin_mode": "isolated",
   "order_amount_usdt": 30.0,
-  "bid_spread": 0.003817,
-  "ask_spread": 0.003817,
+  "bid_spread": 0.00312,
+  "ask_spread": 0.00312,
   "minimum_spread": 0.0025,
   "order_levels": 3,
-  "order_level_spread": 0.005726,
+  "order_level_spread": 0.00468,
   "order_level_amount": 0.0,
   "level_cooldown_sec": 1800,
   "order_refresh_time": 45,
@@ -28,7 +28,7 @@
   "skew_kappa": 1.0,
   "skew_gamma_net": 0.001,
   "tp_skew_boost": 0.5,
-  "take_profit": 0.007635,
+  "take_profit": 0.00624,
   "take_profit_order_type": "LIMIT_MAKER",
   "tp_levels": [
     [
@@ -41,9 +41,9 @@
     ]
   ],
   "trailing_tp_enabled": true,
-  "trailing_tp_activation_pct": 0.007635,
-  "trailing_tp_callback_pct": 0.002672,
-  "stop_loss": 0.022904,
+  "trailing_tp_activation_pct": 0.00624,
+  "trailing_tp_callback_pct": 0.002184,
+  "stop_loss": 0.018721,
   "stop_loss_order_type": "MARKET",
   "trailing_stop": {
     "activation_price": 0.012,
