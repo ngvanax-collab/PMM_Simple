@@ -7,6 +7,7 @@ from loguru import logger
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.gateway import ExchangeGateway
 from app.core.pair_rebalancer import rebalancer_service
+from app.core.ratelimit import rate_limiter
 from app.core.worker import PMMWorker
 from app.models.config import ExchangeCredentials, GlobalConfig, PairConfig
 from app.models.state import FillRecord, OrderPurpose, OrderRecord, OrderSide, OrderType, PositionSide
@@ -19,6 +20,10 @@ class BotManager:
 
     def __init__(self):
         self.global_config: GlobalConfig = config_store.load_global_config()
+        rate_limiter.configure(
+            orders_per_min=self.global_config.order_budget_per_min,
+            weight_per_min=self.global_config.weight_budget_per_min,
+        )
         self.circuit_breaker = CircuitBreaker(self.global_config)
         self.gateway: Optional[ExchangeGateway] = None
         self.workers: Dict[str, PMMWorker] = {}  # symbol -> PMMWorker
@@ -369,9 +374,23 @@ class BotManager:
         """Periodic background task to check account circuit breaker and per-pair loss limits."""
         while self._is_running:
             try:
+                balance = None
+                maint_margin = None
+                if self.gateway and getattr(self.gateway, "_is_connected", False) and hasattr(self.gateway, "_exchange") and self.gateway._exchange:
+                    try:
+                        await rate_limiter.acquire_weight(2)
+                        raw = await self.gateway._exchange.fetch_balance()
+                        info = raw.get("info", {}) if isinstance(raw, dict) else {}
+                        raw_bal = info.get("totalWalletBalance") or (raw.get("USDT", {}).get("total") if isinstance(raw.get("USDT"), dict) else 0.0) or 0.0
+                        raw_maint = info.get("totalMaintMargin") or 0.0
+                        balance = float(raw_bal) if float(raw_bal or 0.0) > 0 else None
+                        maint_margin = float(raw_maint) if float(raw_maint or 0.0) > 0 else (0.0 if balance is not None else None)
+                    except Exception as e:
+                        logger.warning(f"Health monitor balance fetch failed: {e}")
+
                 tripped, reason = await self.circuit_breaker.check_account_health(
-                    total_account_balance=1000.0,
-                    total_maintenance_margin=0.0,
+                    total_account_balance=balance,
+                    total_maintenance_margin=maint_margin,
                 )
                 if tripped:
                     logger.critical(f"Circuit Breaker activated! Executing Emergency Kill-All: {reason}")

@@ -492,10 +492,12 @@ class PMMWorker:
 
         while self._running:
             try:
-                # 1. Fetch latest ticker if missing or as fallback
-                ticker = await self.gateway.fetch_ticker_and_mark(self.symbol)
-                if ticker and ticker["bid"] > 0 and ticker["ask"] > 0:
-                    await self.on_ticker_update(ticker["bid"], ticker["ask"], ticker["mark"])
+                # 1. Fetch latest ticker only if WS stream is stale (TASK H-8)
+                is_ws_stale = (time.time() - self.market_state.last_update_time >= 5.0)
+                if is_ws_stale:
+                    ticker = await self.gateway.fetch_ticker_and_mark(self.symbol)
+                    if ticker and ticker.get("bid", 0.0) > 0 and ticker.get("ask", 0.0) > 0:
+                        await self.on_ticker_update(ticker["bid"], ticker["ask"], ticker.get("mark", 0.0))
 
                 # If still no valid top of book, wait with backoff
                 if self.market_state.best_bid <= 0 or self.market_state.best_ask <= 0 or self.market_state.best_bid >= self.market_state.best_ask:
