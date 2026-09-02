@@ -660,7 +660,12 @@ class ExchangeGateway:
             logger.error(f"[{symbol}] Failed to fetch ticker/orderbook: {e}")
             return None
 
-    async def watch_public_ticker(self, symbol: str, on_update: Callable[[float, float, float], Any]) -> None:
+    async def watch_public_ticker(
+        self,
+        symbol: str,
+        on_update: Callable[[float, float, float], Any],
+        on_reconnect: Optional[Callable[[], Any]] = None,
+    ) -> None:
         """Continuously watch public ticker or orderbook for a symbol via WebSocket."""
         while self._running and self._exchange:
             try:
@@ -692,6 +697,13 @@ class ExchangeGateway:
             except Exception as e:
                 if self._running:
                     logger.warning(f"[{symbol}] Public WS watch_ticker exception (reconnecting in 2s): {e}")
+                    if on_reconnect:
+                        try:
+                            rec_res = on_reconnect()
+                            if asyncio.iscoroutine(rec_res):
+                                await rec_res
+                        except Exception as rec_err:
+                            logger.warning(f"[{symbol}] on_reconnect callback error: {rec_err}")
                     await asyncio.sleep(2.0)
 
     # ── Precision & Filter Helpers ──

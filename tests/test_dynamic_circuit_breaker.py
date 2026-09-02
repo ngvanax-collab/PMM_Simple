@@ -69,17 +69,17 @@ async def test_dynamic_threshold_scales_with_natr():
     ms = MarketState(config)
 
     # 1. NATR = 1.5% (0.015)
-    ms.update_natr_15m(1.5)  # 1.5%
+    ms.update_natr_15m(0.015)  # 1.5%
     assert pytest.approx(ms.current_natr_15m, 1e-5) == 0.015
     assert pytest.approx(ms.get_circuit_breaker_threshold(), 1e-5) == 0.015
 
     # 2. NATR = 0.5% (0.005) -> clamped at floor 0.008
-    ms.update_natr_15m(0.5)  # 0.5%
+    ms.update_natr_15m(0.005)  # 0.5%
     assert pytest.approx(ms.current_natr_15m, 1e-5) == 0.005
     assert pytest.approx(ms.get_circuit_breaker_threshold(), 1e-5) == 0.008
 
     # 3. NATR = 2.4% (0.024)
-    ms.update_natr_15m(2.4)
+    ms.update_natr_15m(0.024)
     assert pytest.approx(ms.get_circuit_breaker_threshold(), 1e-5) == 0.024
 
 
@@ -110,9 +110,9 @@ async def test_circuit_breaker_trips_only_target_pair():
         w_inj.market_state.price_history_60s.append((now - 30, 25.00))
 
         # Set NATR 15m
-        w_xpl.market_state.update_natr_15m(1.0)  # threshold = 1.0% (0.010)
-        w_zec.market_state.update_natr_15m(1.0)
-        w_inj.market_state.update_natr_15m(1.0)
+        w_xpl.market_state.update_natr_15m(0.010)  # threshold = 1.0% (0.010)
+        w_zec.market_state.update_natr_15m(0.010)
+        w_inj.market_state.update_natr_15m(0.010)
 
         # XPL experiences 2.5% price spike
         w_xpl.market_state.price_history_60s.append((now, 1.025))
@@ -254,7 +254,7 @@ async def test_auto_resume_after_cooldown_window():
     worker.market_state.best_ask = 1.0020
     worker.market_state.smoothed_mid = 1.0010
     worker.market_state.mark_price = 1.0010
-    worker.market_state.update_natr_15m(1.2)  # threshold = 1.2% (0.012)
+    worker.market_state.update_natr_15m(0.012)  # threshold = 1.2% (0.012)
 
     # 1. Trip the CB at t = 1000
     t0 = 1000.0
