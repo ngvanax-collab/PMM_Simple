@@ -332,6 +332,24 @@ async def test_favorable_pyramiding_and_breakeven_sl():
     assert pyr_call.kwargs["position_side"] == PositionSide.LONG
     assert pyr_call.kwargs["amount"] == 0.5  # 50% of initial 1.0
 
+    # Deliver real fill event via worker.on_fill
+    pyr_cid = worker.executor_long.state.pending_pyramid_client_id
+    fill_pyr = FillRecord(
+        id="fill_pyr_real",
+        order_id="pyr_order_1",
+        client_order_id=pyr_cid,
+        symbol="SOL/USDT:USDT",
+        side=OrderSide.BUY,
+        position_side=PositionSide.LONG,
+        price=101.20,
+        amount=0.5,
+        quote_amount=50.60,
+        timestamp=t_tick + 0.1,
+        realized_pnl=0.0,
+    )
+    with patch("time.time", return_value=t_tick + 0.1):
+        await worker.on_fill(fill_pyr)
+
     # 4. Verify Position and Guaranteed Profit SL updates
     exec_state = worker.executor_long.state
     assert exec_state.pyramid_filled_count == 1
@@ -346,8 +364,8 @@ async def test_favorable_pyramiding_and_breakeven_sl():
     assert exec_state.sl_price >= 100.40
     assert exec_state.sl_price >= (entry_p * 1.0035)  # >= 100.35
 
-    # Trailing callback must be tightened to 20% of TP_base (0.20 * 0.010 = 0.0020)
-    assert cfg.trailing_tp_callback_pct == pytest.approx(0.0020, rel=1e-4)
+    # Trailing callback must be tightened to 20% of TP_base (0.20 * 0.010 = 0.0020) on local executor
+    assert worker.executor_long._trailing_cb_override == pytest.approx(0.0020, rel=1e-4)
 
     # 5. Simulate closing position
     exit_fill = FillRecord(

@@ -1,7 +1,7 @@
-"""Position Tracker: 2 Independent Slots (LONG and SHORT) with Fill Updates & REST Reconcile."""
 import asyncio
+from collections import deque
 import time
-from typing import Optional, Tuple
+from typing import Deque, Optional, Set, Tuple
 from loguru import logger
 
 from app.core.gateway import ExchangeGateway
@@ -33,6 +33,8 @@ class PositionTracker:
         )
         self._lock = asyncio.Lock()
         self.last_reconcile_time = 0.0
+        self._processed_fill_ids: Set[str] = set()
+        self._processed_fill_order: Deque[str] = deque(maxlen=10000)
 
     @property
     def gross_exposure_usdt(self) -> float:
@@ -93,6 +95,21 @@ class PositionTracker:
     async def on_fill(self, fill: FillRecord) -> None:
         """Process incoming trade fill to update position state."""
         async with self._lock:
+            # Check fill idempotency (exactly-once processing)
+            if fill.id:
+                if fill.id in self._processed_fill_ids:
+                    logger.warning(
+                        f"[{self.symbol}][IDEMPOTENCY] Duplicate fill event detected and ignored: id={fill.id}, cid={fill.client_order_id}"
+                    )
+                    return
+                if len(self._processed_fill_order) == self._processed_fill_order.maxlen:
+                    oldest_id = self._processed_fill_order.popleft()
+                    self._processed_fill_ids.discard(oldest_id)
+                self._processed_fill_ids.add(fill.id)
+                self._processed_fill_order.append(fill.id)
+            else:
+                logger.debug(f"[{self.symbol}][IDEMPOTENCY] Fill with empty id received, proceeding: cid={fill.client_order_id}")
+
             # Defensive normalization: extract position_side from client_order_id if present
             cid = str(fill.client_order_id or "").lower()
             if "short" in cid or "q_sell" in cid:

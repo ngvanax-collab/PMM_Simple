@@ -380,7 +380,13 @@ class PMMWorker:
         cid = str(fill.client_order_id or "").lower()
 
         # 1. Routing classification based on standardized client_order_id prefixes
-        if cid.startswith("q_buy_"):
+        if cid.startswith("q_pyr_"):
+            if "short" in cid:
+                fill.position_side = PositionSide.SHORT
+            elif "long" in cid:
+                fill.position_side = PositionSide.LONG
+            is_entry = True
+        elif cid.startswith("q_buy_"):
             fill.position_side = PositionSide.LONG
             is_entry = True
         elif cid.startswith("q_sell_"):

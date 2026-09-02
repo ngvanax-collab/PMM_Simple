@@ -142,6 +142,8 @@ class ExecutorBarrierState(BaseModel):
     filled_levels_count: int = Field(default=0, ge=0, description="Number of levels filled in current position cycle")
     is_trend_blocked: bool = Field(default=False, description="Flag indicating entry quote is blocked by trend bias")
     pyramid_filled_count: int = Field(default=0, ge=0, description="Number of favorable pyramid fills in current position cycle (max 1)")
+    pending_pyramid_client_id: Optional[str] = Field(default=None, description="Client order ID of pending pyramid market entry")
+    pending_pyramid_started_at: float = Field(default=0.0, description="Timestamp when pyramid market order was dispatched")
     is_guaranteed_sl_locked: bool = Field(default=False, description="Flag confirming Stop Loss is locked to guaranteed breakeven/profit")
     trend_bias_regime: str = Field(default="NEUTRAL", description="Trend regime: BULLISH, BEARISH, NEUTRAL")
 
