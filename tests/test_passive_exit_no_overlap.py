@@ -150,14 +150,7 @@ async def test_passive_exit_escalation_to_market_after_two_refreshes():
         assert executor.state.passive_exit_refresh_count == 1
         assert executor.state.passive_exit_active is True
 
-    # 3. Timeout cycle 2 (at now + 70s)
-    now += 70.0
-    with patch("time.time", return_value=now):
-        await executor._handle_passive_time_limit_exit(current_price=100.0, best_bid=99.9, best_ask=100.1)
-        assert executor.state.passive_exit_refresh_count == 2
-        assert executor.state.passive_exit_active is True
-
-    # 4. Timeout cycle 3 (at now + 70s) -> refresh count becomes 3 (> 2) -> ESCALATE TO MARKET
+    # 3. Timeout cycle 2 (at now + 70s) -> refresh count becomes 2 (>= 2) -> ESCALATE TO MARKET
     now += 70.0
     with patch("time.time", return_value=now):
         await executor._handle_passive_time_limit_exit(current_price=100.0, best_bid=99.9, best_ask=100.1)

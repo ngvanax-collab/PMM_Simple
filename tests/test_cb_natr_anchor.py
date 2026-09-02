@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.core.gateway import ExchangeGateway
-from app.core.market_state import MarketState
-from app.core.worker import PMMWorker, calculate_atr_from_candles
+from app.core.market_state import MarketState, calculate_atr_from_candles
+from app.core.worker import PMMWorker
 from app.models.config import PairConfig
 
 

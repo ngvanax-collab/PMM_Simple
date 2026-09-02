@@ -133,17 +133,6 @@ class FRPositionTracker:
         dual_pos.recalculate()
         return dual_pos
 
-    def record_funding_payment(self, symbol: str, exchange: str, position_side: str, payment_amount: float) -> None:
-        """Record funding fee received (+) or paid (-)."""
-        sym = self._canon(symbol)
-        dual_pos = self.get_or_create_position(sym)
-        pos_side = position_side.upper()
-        leg = dual_pos.long_leg if pos_side == "LONG" else dual_pos.short_leg
-        leg.funding_accrued += payment_amount
-        self.realized_funding_pnl += payment_amount
-        dual_pos.recalculate()
-        logger.info(f"[{sym}] Recorded funding payment {payment_amount:+.4f} USDT on {exchange.upper()} ({pos_side})")
-
     def reconcile_with_exchange_positions(
         self,
         binance_raw_positions: List[Dict[str, Any]],

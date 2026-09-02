@@ -7,30 +7,12 @@ from loguru import logger
 from app.core.circuit_breaker import utc_day_start
 from app.core.executor import TripleBarrierExecutor
 from app.core.gateway import ExchangeGateway
-from app.core.market_state import MarketState
+from app.core.market_state import MarketState, calculate_atr_from_candles
 from app.core.position_tracker import PositionTracker
 from app.core.quoter import PMMQuoter, QuoteLevel
 from app.models.config import PairConfig
 from app.models.state import FillRecord, OrderPurpose, OrderRecord, OrderSide, OrderStatus, OrderType, PositionSide
 from app.persistence.db import db
-
-
-def calculate_atr_from_candles(candles: List[List[float]], period: int = 14) -> float:
-    """Calculate Average True Range (ATR) from OHLCV candles."""
-    if len(candles) < 2:
-        return 0.0
-    true_ranges = []
-    for i in range(1, len(candles)):
-        h = float(candles[i][2])
-        l = float(candles[i][3])
-        prev_c = float(candles[i - 1][4])
-        tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
-        true_ranges.append(tr)
-    if not true_ranges:
-        return 0.0
-    if len(true_ranges) < period:
-        return sum(true_ranges) / len(true_ranges)
-    return sum(true_ranges[-period:]) / float(period)
 from app.persistence.store import config_store
 
 

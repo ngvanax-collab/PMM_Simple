@@ -764,7 +764,7 @@ class TripleBarrierExecutor:
                 self.state.passive_exit_active = False
 
                 # Escalation: after 2 refresh cycles without filling, escalate to immediate MARKET exit (TASK M-3)
-                if self.state.passive_exit_refresh_count > 2:
+                if self.state.passive_exit_refresh_count >= 2:
                     logger.critical(
                         f"[{self.symbol}][{self.position_side.value}][PASSIVE_EXIT_ESCALATION] Passive exit failed to fill "
                         f"after {self.state.passive_exit_refresh_count} cycles. Escalating to MARKET exit."
