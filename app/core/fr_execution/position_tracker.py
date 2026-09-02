@@ -13,6 +13,7 @@ class FRPositionTracker:
         self.positions: Dict[str, DualLegPosition] = {}  # symbol -> DualLegPosition
         self.realized_funding_pnl: float = 0.0
         self.last_reconciled_at: float = 0.0
+        self.processed_funding_ids: set = set()  # Deduplicate real funding transactions (TASK L-2)
 
     @staticmethod
     def _canon(symbol: str) -> str:
@@ -215,11 +216,10 @@ class FRPositionTracker:
             total_pnl += pos.total_funding_accrued + pos.net_upnl
             total_notional += (pos.long_leg.notional + pos.short_leg.notional)
 
-        # Estimate APR based on net edge and active capital
+        # Compute APR based on real net PnL and active capital (TASK L-1)
         net_apr = 0.0
-        if total_notional > 0:
-            # Assuming annualized edge ~ 15-30%
-            net_apr = round(max(0.0, (total_pnl / total_notional) * 365.0 * 100.0), 2) if total_pnl > 0 else 24.5
+        if total_notional > 0 and total_pnl > 0:
+            net_apr = round((total_pnl / total_notional) * 365.0 * 100.0, 2)
 
         return FRSummaryMetrics(
             total_realized_funding_pnl=round(self.realized_funding_pnl, 4),
@@ -230,3 +230,46 @@ class FRPositionTracker:
             total_equity_usdt=round(binance_free_margin + bybit_free_margin, 2),
             last_reconciled_at=self.last_reconciled_at,
         )
+
+    def record_funding_payment(
+        self,
+        symbol: str,
+        exchange: str,
+        position_side: str = "LONG",
+        payment_amount: float = 0.0,
+        amount: Optional[float] = None,
+        funding_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """
+        Record real funding payment deduplicated by transaction ID (TASK L-2).
+        Supports both direct amount tracking and transaction deduplication.
+        """
+        eff_amount = amount if amount is not None else payment_amount
+        ts = timestamp if timestamp is not None else time.time()
+        fid = funding_id or f"funding_{exchange}_{symbol}_{position_side}_{ts}_{eff_amount}"
+
+        if fid in self.processed_funding_ids:
+            return False
+        self.processed_funding_ids.add(fid)
+        if len(self.processed_funding_ids) > 2000:
+            self.processed_funding_ids = set(list(self.processed_funding_ids)[-1000:])
+
+        sym = self._canon(symbol)
+        if sym in self.positions:
+            pos = self.positions[sym]
+            ex = exchange.lower()
+            side_upper = str(position_side).upper()
+            if pos.long_leg.exchange == ex and (side_upper == "LONG" or pos.short_leg.exchange != ex):
+                pos.long_leg.funding_accrued += eff_amount
+                pos.long_leg.last_updated = ts
+            elif pos.short_leg.exchange == ex and (side_upper == "SHORT" or pos.long_leg.exchange != ex):
+                pos.short_leg.funding_accrued += eff_amount
+                pos.short_leg.last_updated = ts
+            else:
+                pos.total_funding_accrued += eff_amount
+            pos.recalculate()
+
+        self.realized_funding_pnl += eff_amount
+        logger.info(f"[{exchange.upper()}][{sym}] Recorded funding payment: ${eff_amount:+.4f} (ID: {fid})")
+        return True

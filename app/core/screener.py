@@ -608,18 +608,11 @@ class QuantitativeScreener:
                                 )
                                 return None
 
-                            # Depth calculation from real orderbook snapshot or fallback to volume estimation
+                            # Depth calculation from real orderbook snapshot via gateway rate-limited method (TASK M-6)
                             depth_1pct = max(50_000.0, min(500_000.0, vol_24h * 0.001))
-                            if hasattr(gateway._exchange, "fetch_order_book") and price > 0:
+                            if hasattr(gateway, "fetch_orderbook_depth_snapshot") and price > 0:
                                 try:
-                                    ob = await gateway._exchange.fetch_order_book(sym, limit=20)
-                                    bids = ob.get("bids") or []
-                                    asks = ob.get("asks") or []
-                                    min_bid = price * 0.99
-                                    max_ask = price * 1.01
-                                    b_depth = sum(float(p) * float(q) for p, q in bids if float(p) >= min_bid)
-                                    a_depth = sum(float(p) * float(q) for p, q in asks if float(p) <= max_ask)
-                                    real_depth = b_depth + a_depth
+                                    real_depth = await gateway.fetch_orderbook_depth_snapshot(sym, pct=0.01)
                                     if real_depth > 0:
                                         depth_1pct = float(real_depth)
                                 except Exception as e:

@@ -387,6 +387,25 @@ class MultiExchangeGateway:
             logger.warning(f"[{ex_name.upper()}] Error fetching positions: {e}")
             return []
 
+    async def fetch_funding_history(self, exchange: str, symbol: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """Fetch real funding payment history for exchange guarded by rate limiter (TASK L-2)."""
+        ex_name = exchange.lower()
+        ex = self.exchanges.get(ex_name)
+        if not ex:
+            return []
+
+        try:
+            await rate_limiter.acquire_weight(weight=2)
+            norm_sym = self.normalize_symbol(ex_name, symbol) if symbol else None
+            if hasattr(ex, "fetch_funding_history"):
+                return await ex.fetch_funding_history(symbol=norm_sym, limit=limit) or []
+            elif hasattr(ex, "fetch_funding_rate_history"):
+                return await ex.fetch_funding_rate_history(symbol=norm_sym, limit=limit) or []
+            return []
+        except Exception as e:
+            logger.debug(f"[{ex_name.upper()}] Note on fetching funding history: {e}")
+            return []
+
     async def close(self) -> None:
         """Gracefully close all exchange connections."""
         self._running = False

@@ -29,8 +29,8 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode = WAL;")
         await self._conn.execute("PRAGMA synchronous = NORMAL;")
         await self._conn.execute("PRAGMA foreign_keys = ON;")
-        await self._conn.execute("PRAGMA busy_timeout = 30000;")
-        await self._conn.commit()
+        await self._conn.execute("PRAGMA busy_timeout = 60000;")
+        await self._conn.commit();
 
         await self._create_tables()
         logger.info(f"Database initialized at {self.db_path} (WAL mode enabled)")
@@ -191,7 +191,7 @@ class Database:
                 return
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 4:
-                    await asyncio.sleep(0.05 * (attempt + 1))
+                    await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
                     continue
                 logger.warning(f"Failed to save barrier state for {symbol} {pos_side}: {e}")
                 return
@@ -233,7 +233,7 @@ class Database:
                 return
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 4:
-                    await asyncio.sleep(0.05 * (attempt + 1))
+                    await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
                     continue
                 logger.warning(f"Failed to delete barrier state for {symbol} {pos_side}: {e}")
                 return
@@ -284,7 +284,7 @@ class Database:
                 return
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 4:
-                    await asyncio.sleep(0.05 * (attempt + 1))
+                    await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
                     continue
                 logger.warning(f"Failed to save order {order.id}: {e}")
                 return
@@ -345,7 +345,7 @@ class Database:
                 return
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 4:
-                    await asyncio.sleep(0.05 * (attempt + 1))
+                    await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
                     continue
                 logger.warning(f"Failed to save fill {fill.id}: {e}")
                 return
@@ -398,7 +398,7 @@ class Database:
                     return cursor.lastrowid or 0
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 4:
-                    await asyncio.sleep(0.05 * (attempt + 1))
+                    await asyncio.sleep(min(0.05 * (2 ** attempt), 1.0))
                     continue
                 logger.warning(f"Failed to record PnL for {record.symbol}: {e}")
                 return 0
