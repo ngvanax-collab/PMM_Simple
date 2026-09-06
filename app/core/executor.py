@@ -405,6 +405,82 @@ class TripleBarrierExecutor:
             if self.state.active and not self._is_exiting:
                 await self._place_take_profit_orders()
 
+    async def _safe_create_exit_order(
+        self,
+        side: OrderSide,
+        order_type: OrderType,
+        amount: float,
+        price: Optional[float] = None,
+        client_order_id: Optional[str] = None,
+        purpose: OrderPurpose = OrderPurpose.TAKE_PROFIT,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create exit order with automatic -2022 reconciliation and single retry (TASK RO-4).
+        If Binance rejects with -2022 (ReduceOnly Order is rejected due to size/position mismatch),
+        reconciles true position with exchange and retries once with the updated remaining quantity.
+        """
+        resp = await self.gateway.create_exit_order(
+            symbol=self.symbol,
+            side=side,
+            position_side=self.position_side,
+            order_type=order_type,
+            amount=amount,
+            price=price,
+            client_order_id=client_order_id,
+            purpose=purpose,
+        )
+        if resp:
+            return resp
+
+        # Check for -2022 rejection
+        last_err = getattr(self.gateway, "_last_exit_error", "")
+        if "-2022" in last_err:
+            logger.warning(
+                f"[{self.symbol}][{self.position_side.value}] Exit order rejected with -2022. "
+                f"Reconciling position with exchange before retry..."
+            )
+            await self.tracker.reconcile_with_exchange()
+
+            # Recalculate remaining amount from reconciled state
+            pos_state = (
+                self.tracker.long_pos
+                if self.position_side == PositionSide.LONG
+                else self.tracker.short_pos
+            )
+            reconciled_qty = getattr(pos_state, "amount", 0.0)
+            self.state.remaining_qty = reconciled_qty
+            if reconciled_qty <= 0:
+                logger.info(
+                    f"[{self.symbol}][{self.position_side.value}] Reconciled position is flat (amount=0). "
+                    f"Aborting exit order retry."
+                )
+                self.state.active = False
+                return None
+
+            retry_amount = self.quoter.quantize_amount(min(amount, reconciled_qty))
+            if retry_amount <= 0:
+                return None
+
+            logger.info(
+                f"[{self.symbol}][{self.position_side.value}] Retrying exit order with reconciled amount {retry_amount:.4f}..."
+            )
+            retry_client_id = f"{client_order_id}_r"[:36] if client_order_id else None
+            retry_resp = await self.gateway.create_exit_order(
+                symbol=self.symbol,
+                side=side,
+                position_side=self.position_side,
+                order_type=order_type,
+                amount=retry_amount,
+                price=price,
+                client_order_id=retry_client_id,
+                purpose=purpose,
+            )
+            if retry_resp and isinstance(retry_resp, dict):
+                retry_resp["amount"] = retry_amount
+            return retry_resp
+
+        return None
+
     async def _place_take_profit_orders(self) -> None:
         """Place multi-level Take Profit orders with inventory skew boost."""
         # Cancel any previous TP orders before placing new ones
@@ -448,10 +524,8 @@ class TripleBarrierExecutor:
             tp_price = self.quoter.quantize_price(raw_tp_price, is_bid=not is_tp_ask)
             client_id = _safe_client_order_id(f"tp_{self.position_side.value.lower()}_{idx}")
 
-            order_resp = await self.gateway.create_exit_order(
-                symbol=self.symbol,
+            order_resp = await self._safe_create_exit_order(
                 side=self.exit_side,
-                position_side=self.position_side,
                 order_type=OrderType.LIMIT_MAKER if self.config.take_profit_order_type == "LIMIT_MAKER" else OrderType.LIMIT,
                 amount=qty,
                 price=tp_price,
@@ -461,11 +535,12 @@ class TripleBarrierExecutor:
 
             if order_resp:
                 order_id = str(order_resp.get("id") or client_id)
+                actual_qty = float(order_resp.get("amount") or qty)
                 self.state.tp_orders.append({
                     "order_id": order_id,
                     "client_order_id": client_id,
                     "price": tp_price,
-                    "qty": qty,
+                    "qty": actual_qty,
                     "level": idx,
                     "status": "OPEN",
                 })
@@ -802,10 +877,8 @@ class TripleBarrierExecutor:
             exit_price = self.quoter.quantize_price(target_p, is_bid=True)
 
         client_id = _safe_client_order_id(f"pe_{self.position_side.value.lower()}")
-        resp = await self.gateway.create_exit_order(
-            symbol=self.symbol,
+        resp = await self._safe_create_exit_order(
             side=self.exit_side,
-            position_side=self.position_side,
             order_type=OrderType.LIMIT_MAKER,
             amount=qty,
             price=exit_price,
@@ -849,10 +922,8 @@ class TripleBarrierExecutor:
             pos_str = self.position_side.value.lower()
             client_id = _safe_client_order_id(f"ex_{purp_str}_{pos_str}")
 
-        resp = await self.gateway.create_exit_order(
-            symbol=self.symbol,
+        resp = await self._safe_create_exit_order(
             side=self.exit_side,
-            position_side=self.position_side,
             order_type=OrderType.MARKET,
             amount=pos_qty,
             client_order_id=client_id,
