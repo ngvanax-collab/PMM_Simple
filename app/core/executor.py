@@ -22,6 +22,15 @@ from app.models.state import (
 from app.persistence.db import db
 
 
+def _safe_client_order_id(prefix: str, max_len: int = 36) -> str:
+    """Đảm bảo client_order_id luôn <= max_len ký tự theo giới hạn Binance (TASK RO-3)."""
+    ts = str(int(time.time() * 1000))
+    budget = max_len - len(ts) - 1  # trừ 1 cho dấu gạch dưới nối với ts
+    safe_prefix = prefix[:max(1, budget)]
+    cid = f"{safe_prefix}_{ts}"
+    return cid[:max_len]
+
+
 class TripleBarrierExecutor:
     """Manages Take Profit, Virtual Local Stop Loss, Dynamic Trailing TP, and Passive Maker Time-Limit Exit."""
 
@@ -437,7 +446,7 @@ class TripleBarrierExecutor:
             # TP is an exit order — quantize in the safe direction for Post-Only maker
             is_tp_ask = (self.position_side == PositionSide.LONG)
             tp_price = self.quoter.quantize_price(raw_tp_price, is_bid=not is_tp_ask)
-            client_id = f"tp_{self.position_side.value.lower()}_{idx}_{int(time.time()*1000)}"
+            client_id = _safe_client_order_id(f"tp_{self.position_side.value.lower()}_{idx}")
 
             order_resp = await self.gateway.create_exit_order(
                 symbol=self.symbol,
@@ -533,7 +542,7 @@ class TripleBarrierExecutor:
             return False
 
         entry_side = OrderSide.BUY if self.position_side == PositionSide.LONG else OrderSide.SELL
-        client_id = f"q_pyr_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+        client_id = _safe_client_order_id(f"q_pyr_{self.position_side.value.lower()}")
 
         logger.info(
             f"[{self.symbol}][{self.position_side.value}][MOMENTUM_PYRAMID] Favorable Momentum Pyramid triggered: "
@@ -792,7 +801,7 @@ class TripleBarrierExecutor:
             target_p = min(self.state.entry_price * (1.0 - offset_pct), best_bid if best_bid > 0 else current_price)
             exit_price = self.quoter.quantize_price(target_p, is_bid=True)
 
-        client_id = f"pe_{self.position_side.value.lower()}_{int(now*1000)}"
+        client_id = _safe_client_order_id(f"pe_{self.position_side.value.lower()}")
         resp = await self.gateway.create_exit_order(
             symbol=self.symbol,
             side=self.exit_side,
@@ -832,11 +841,13 @@ class TripleBarrierExecutor:
         await self._cleanup_all_barrier_orders()
 
         if purpose == OrderPurpose.STOP_LOSS:
-            client_id = f"sl_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+            client_id = _safe_client_order_id(f"sl_{self.position_side.value.lower()}")
         elif purpose in (OrderPurpose.TAKE_PROFIT, OrderPurpose.TRAILING_TAKE_PROFIT):
-            client_id = f"tp_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+            client_id = _safe_client_order_id(f"tp_{self.position_side.value.lower()}")
         else:
-            client_id = f"exit_{purpose.value.lower()}_{self.position_side.value.lower()}_{int(time.time()*1000)}"
+            purp_str = purpose.value.lower()
+            pos_str = self.position_side.value.lower()
+            client_id = _safe_client_order_id(f"ex_{purp_str}_{pos_str}")
 
         resp = await self.gateway.create_exit_order(
             symbol=self.symbol,

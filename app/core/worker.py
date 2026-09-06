@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from app.core.circuit_breaker import utc_day_start
-from app.core.executor import TripleBarrierExecutor
+from app.core.executor import TripleBarrierExecutor, _safe_client_order_id
 from app.core.gateway import ExchangeGateway
 from app.core.market_state import MarketState, calculate_atr_from_candles
 from app.core.position_tracker import PositionTracker
@@ -781,7 +781,7 @@ class PMMWorker:
                 if idx in matched_targets:
                     continue  # Keep existing active order (retaining maker queue priority)
 
-                client_id = f"q_{tq.side.value.lower()}_{tq.level}_{int(time.time()*1000)}"
+                client_id = _safe_client_order_id(f"q_{tq.side.value.lower()}_{tq.level}")
                 resp = await self.gateway.create_quote_order(
                     symbol=self.symbol,
                     side=tq.side,
