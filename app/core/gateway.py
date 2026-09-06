@@ -12,6 +12,9 @@ from app.models.config import ExchangeCredentials
 from app.models.state import FillRecord, OrderPurpose, OrderRecord, OrderSide, OrderStatus, OrderType, PositionSide, SidePositionState
 
 
+AUTH_ERROR_CODES = ("-2015", "-2014", "-1022")  # Invalid API-key/IP/permission/signature (TASK RO-2)
+
+
 class ExchangeGateway:
     """Unified Exchange Gateway for Futures Hedge Mode."""
 
@@ -32,6 +35,34 @@ class ExchangeGateway:
 
         # Free balance cache (currency -> (timestamp, free_amount)) with TTL 1.5s
         self._free_balance_cache: Dict[str, Tuple[float, float]] = {}
+
+        # REST Health Circuit Breaker state (TASK RO-2)
+        self._consecutive_auth_errors: int = 0
+        self._auth_error_tripped_at: float = 0.0
+        self._last_exit_error: str = ""
+
+    def _record_call_result(self, success: bool, err_msg: str = "") -> None:
+        """
+        Record REST API call result to manage REST Health Circuit Breaker (TASK RO-2).
+        Trips when consecutive auth/permission errors >= 3.
+        Auto-resets on any successful REST call.
+        """
+        if not success and any(code in err_msg for code in AUTH_ERROR_CODES):
+            self._consecutive_auth_errors += 1
+            if self._consecutive_auth_errors >= 3 and self._auth_error_tripped_at == 0.0:
+                self._auth_error_tripped_at = time.time()
+                logger.critical(
+                    f"REST AUTH ERROR THRESHOLD REACHED ({self._consecutive_auth_errors} lỗi liên tiếp). "
+                    f"API key/IP có thể bị chặn. Toàn bộ quoting sẽ tạm dừng."
+                )
+        elif success:
+            self._consecutive_auth_errors = 0
+            self._auth_error_tripped_at = 0.0
+
+    @property
+    def is_auth_healthy(self) -> bool:
+        """Return False if REST authentication/permission errors tripped circuit breaker."""
+        return self._auth_error_tripped_at == 0.0
 
     async def initialize(self) -> bool:
         """Initialize ccxt.pro instance, load markets, and verify Hedge Mode."""
@@ -228,6 +259,7 @@ class ExchangeGateway:
                     logger.info(
                         f"[{symbol}] Post-Only maker succeeded on retry #{attempt} at stepped price {curr_price}"
                     )
+                self._record_call_result(True)
                 return order
             except Exception as e:
                 err_msg = str(e)
@@ -250,6 +282,7 @@ class ExchangeGateway:
                     )
                     continue
                 else:
+                    self._record_call_result(False, err_msg)
                     if is_post_only_rejection:
                         logger.warning(f"[{symbol}] Post-Only maker rejected (crossed book): {err_msg}")
                     elif "-2019" in err_msg or "margin is insufficient" in err_msg.lower():
@@ -341,12 +374,13 @@ class ExchangeGateway:
         await rate_limiter.acquire_order(count=1, weight=1, priority=(purpose in (OrderPurpose.KILL_ALL_EXIT, OrderPurpose.STOP_LOSS)))
 
         try:
+            res = None
             if order_type == OrderType.LIMIT_MAKER or (order_type == OrderType.LIMIT and purpose == OrderPurpose.TAKE_PROFIT):
                 if self.exchange_name == "binance":
                     params["timeInForce"] = "GTX"
                 elif self.exchange_name == "bybit":
                     params["postOnly"] = True
-                return await self._exchange.create_order(
+                res = await self._exchange.create_order(
                     symbol=symbol,
                     type="limit",
                     side=side.value.lower(),
@@ -359,7 +393,7 @@ class ExchangeGateway:
                 # Server-side conditional Stop Loss
                 if self.exchange_name == "binance":
                     params["stopPrice"] = fmt_stop_price
-                    return await self._exchange.create_order(
+                    res = await self._exchange.create_order(
                         symbol=symbol,
                         type="STOP_MARKET",
                         side=side.value.lower(),
@@ -370,7 +404,7 @@ class ExchangeGateway:
                 elif self.exchange_name == "bybit":
                     params["triggerPrice"] = str(fmt_stop_price)
                     params["triggerDirection"] = 2 if side == OrderSide.SELL else 1  # 2: falling for Long SL, 1: rising for Short SL
-                    return await self._exchange.create_order(
+                    res = await self._exchange.create_order(
                         symbol=symbol,
                         type="market",
                         side=side.value.lower(),
@@ -381,7 +415,7 @@ class ExchangeGateway:
 
             elif order_type == OrderType.MARKET:
                 # Direct market exit for Trailing / Time-limit / Kill-All
-                return await self._exchange.create_order(
+                res = await self._exchange.create_order(
                     symbol=symbol,
                     type="market",
                     side=side.value.lower(),
@@ -391,7 +425,7 @@ class ExchangeGateway:
                 )
 
             else:
-                return await self._exchange.create_order(
+                res = await self._exchange.create_order(
                     symbol=symbol,
                     type=order_type.value.lower(),
                     side=side.value.lower(),
@@ -400,7 +434,13 @@ class ExchangeGateway:
                     params=params,
                 )
 
+            self._record_call_result(True)
+            return res
+
         except Exception as e:
+            err_str = str(e)
+            self._last_exit_error = err_str
+            self._record_call_result(False, err_str)
             logger.error(f"[{symbol}] Failed to create exit order ({order_type} {side} {position_side} qty={amount}): {e}")
             return None
 
@@ -412,8 +452,11 @@ class ExchangeGateway:
         await rate_limiter.acquire_order(count=1, weight=1)
         try:
             await self._exchange.cancel_order(order_id, symbol)
+            self._record_call_result(True)
             return True
         except Exception as e:
+            err_msg = str(e)
+            self._record_call_result(False, err_msg)
             logger.warning(f"[{symbol}] Cancel order {order_id} note: {e}")
             return False
 
@@ -539,9 +582,12 @@ class ExchangeGateway:
             if not short_pos:
                 short_pos = SidePositionState(symbol=symbol, position_side=PositionSide.SHORT, amount=0.0)
 
+            self._record_call_result(True)
             return long_pos, short_pos
 
         except Exception as e:
+            err_msg = str(e)
+            self._record_call_result(False, err_msg)
             logger.error(f"[{symbol}] Failed to fetch hedge positions: {e}")
             return None, None
 
@@ -600,8 +646,11 @@ class ExchangeGateway:
 
             final_free = max(0.0, free_amt)
             self._free_balance_cache[currency] = (now, final_free)
+            self._record_call_result(True)
             return final_free
         except Exception as e:
+            err_msg = str(e)
+            self._record_call_result(False, err_msg)
             logger.warning(f"Failed to fetch free balance for {currency}: {e}")
             return 0.0
 

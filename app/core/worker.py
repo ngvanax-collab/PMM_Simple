@@ -591,6 +591,9 @@ class PMMWorker:
 
     def _check_should_requote(self) -> Tuple[bool, str]:
         """Check whether conditions warrant placing/updating quote orders."""
+        if not getattr(self.gateway, "is_auth_healthy", True):
+            return False, "REST auth unhealthy — quoting paused"
+
         if not self._running or self._paused or not self.config.enabled or self.config.is_locked or self.is_locked_killed:
             return False, "Disabled/Paused/Locked"
 
