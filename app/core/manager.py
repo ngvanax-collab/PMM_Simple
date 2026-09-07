@@ -413,6 +413,18 @@ class BotManager:
                         except Exception as pe:
                             logger.error(f"[{worker.symbol}] Error checking pair loss circuit breaker: {pe}")
 
+                # ── Check REST auth health (TASK RO-2) ──
+                if self.gateway and not getattr(self.gateway, "is_auth_healthy", True):
+                    tripped_at = getattr(self.gateway, "_auth_error_tripped_at", 0.0)
+                    tripped_dur = time.time() - tripped_at if tripped_at > 0 else 0.0
+                    now = time.time()
+                    if tripped_dur >= 60.0 and (now - getattr(self, "_last_auth_alert_time", 0.0)) >= 60.0:
+                        self._last_auth_alert_time = now
+                        logger.critical(
+                            f"[AUTH_FAILSAFE] REST API auth errors active for {tripped_dur:.0f}s. "
+                            f"Quoting is paused across all workers. Please check API Key permissions & IP Whitelist on Binance."
+                        )
+
                 await asyncio.sleep(10.0)
             except asyncio.CancelledError:
                 break

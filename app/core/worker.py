@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from app.core.circuit_breaker import utc_day_start
-from app.core.executor import TripleBarrierExecutor
+from app.core.executor import TripleBarrierExecutor, _safe_client_order_id
 from app.core.gateway import ExchangeGateway
 from app.core.market_state import MarketState, calculate_atr_from_candles
 from app.core.position_tracker import PositionTracker
@@ -490,6 +490,26 @@ class PMMWorker:
             self._active_quote_orders.pop(order.id, None)
             self._active_quote_orders.pop(order.client_order_id, None)
 
+    async def reconcile_open_orders(self) -> None:
+        """
+        Synchronize _active_quote_orders with actual open quote orders on the exchange (TASK RO-1).
+        Prevents ghost orders and heals state desynchronization.
+        """
+        try:
+            real_orders = await self.gateway.fetch_open_orders(self.symbol)
+            real_quote_dict: Dict[str, OrderRecord] = {}
+            for o in real_orders:
+                cid = o.client_order_id or ""
+                if cid.startswith("q_buy_") or cid.startswith("q_sell_"):
+                    key = o.exchange_order_id or o.id
+                    real_quote_dict[key] = o
+            self._active_quote_orders = real_quote_dict
+            logger.info(
+                f"[{self.symbol}] Reconciled open quote orders: {len(real_quote_dict)} active on exchange."
+            )
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] Failed to reconcile open quote orders: {e}")
+
     # ── Main Worker Execution Loop ──
 
     async def _main_worker_loop(self) -> None:
@@ -525,6 +545,7 @@ class PMMWorker:
                 if now - last_reconcile >= reconcile_interval:
                     await self.tracker.reconcile_with_exchange()
                     await self.reconcile_barriers()
+                    await self.reconcile_open_orders()
                     last_reconcile = now
 
                 if getattr(self.config, "trend_bias_enabled", True) and (now - last_trend_check >= 300.0):
@@ -570,6 +591,9 @@ class PMMWorker:
 
     def _check_should_requote(self) -> Tuple[bool, str]:
         """Check whether conditions warrant placing/updating quote orders."""
+        if not getattr(self.gateway, "is_auth_healthy", True):
+            return False, "REST auth unhealthy — quoting paused"
+
         if not self._running or self._paused or not self.config.enabled or self.config.is_locked or self.is_locked_killed:
             return False, "Disabled/Paused/Locked"
 
@@ -739,16 +763,25 @@ class PMMWorker:
                         break
 
                 if not matched:
-                    # Cancel only orders that have drifted from target
-                    await self.gateway.cancel_order(self.symbol, ord_id)
-                    self._active_quote_orders.pop(ord_id, None)
+                    # Cancel only orders that have drifted from target (TASK RO-1)
+                    cancel_ok = await self.gateway.cancel_order(self.symbol, ord_id)
+                    if cancel_ok:
+                        self._active_quote_orders.pop(ord_id, None)
+                    else:
+                        logger.critical(
+                            f"[{self.symbol}] Cancel FAILED for order {ord_id} — giữ trong tracking, "
+                            f"không giả định đã hủy. Kích hoạt reconcile khẩn cấp."
+                        )
+                        self._pending_cancel_failures = getattr(self, "_pending_cancel_failures", 0) + 1
+                        self._create_background_task(self.tracker.reconcile_with_exchange())
+                        self._create_background_task(self.reconcile_open_orders())
 
             # ── Place only new target quotes that are not already active ──
             for idx, tq in enumerate(target_quotes):
                 if idx in matched_targets:
                     continue  # Keep existing active order (retaining maker queue priority)
 
-                client_id = f"q_{tq.side.value.lower()}_{tq.level}_{int(time.time()*1000)}"
+                client_id = _safe_client_order_id(f"q_{tq.side.value.lower()}_{tq.level}")
                 resp = await self.gateway.create_quote_order(
                     symbol=self.symbol,
                     side=tq.side,
@@ -789,5 +822,10 @@ class PMMWorker:
         """Cancel all registered active quote orders."""
         order_ids = list(self._active_quote_orders.keys())
         for oid in order_ids:
-            await self.gateway.cancel_order(self.symbol, oid)
-            self._active_quote_orders.pop(oid, None)
+            cancel_ok = await self.gateway.cancel_order(self.symbol, oid)
+            if cancel_ok:
+                self._active_quote_orders.pop(oid, None)
+            else:
+                logger.warning(
+                    f"[{self.symbol}] _cancel_active_quotes: Cancel failed for {oid}, keeping in tracking."
+                )
