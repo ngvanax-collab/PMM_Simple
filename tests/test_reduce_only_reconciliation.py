@@ -134,3 +134,46 @@ async def test_non_2022_error_does_not_trigger_reconcile(mock_executor):
     assert resp is None
     assert not mock_executor.tracker.reconcile_with_exchange.called
     assert mock_executor.gateway.create_exit_order.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_exit_order_2022_retry_client_order_id_unique_when_original_is_max_length(mock_executor):
+    """Ensure retry client_order_id is unique and <= 36 chars when original CID is max length 36."""
+    original_cid = "a" * 36
+
+    def side_effect_create(*args, **kwargs):
+        if mock_executor.gateway.create_exit_order.call_count == 1:
+            mock_executor.gateway._last_exit_error = 'binance {"code":-2022,"msg":"ReduceOnly Order is rejected."}'
+            return None
+        else:
+            return {"id": "exit_retry_ok", "amount": 0.2}
+
+    mock_executor.gateway.create_exit_order = AsyncMock(side_effect=side_effect_create)
+
+    async def mock_reconcile():
+        mock_executor.tracker.short_pos.amount = 0.2
+        return True
+
+    mock_executor.tracker.reconcile_with_exchange = AsyncMock(side_effect=mock_reconcile)
+
+    resp = await mock_executor._safe_create_exit_order(
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT_MAKER,
+        amount=0.4,
+        price=129.0,
+        client_order_id=original_cid,
+        purpose=OrderPurpose.TAKE_PROFIT,
+    )
+
+    assert resp is not None
+    assert mock_executor.gateway.create_exit_order.call_count == 2
+
+    retry_call_kwargs = mock_executor.gateway.create_exit_order.call_args_list[1].kwargs
+    retry_client_id = retry_call_kwargs.get("client_order_id")
+
+    assert retry_client_id is not None
+    assert retry_client_id != original_cid
+    assert len(retry_client_id) <= 36
+    # Verify retry call to gateway used this exact new retry_client_id
+    assert retry_call_kwargs["client_order_id"] == retry_client_id
+

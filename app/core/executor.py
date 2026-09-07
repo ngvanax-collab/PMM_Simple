@@ -464,7 +464,11 @@ class TripleBarrierExecutor:
             logger.info(
                 f"[{self.symbol}][{self.position_side.value}] Retrying exit order with reconciled amount {retry_amount:.4f}..."
             )
-            retry_client_id = f"{client_order_id}_r"[:36] if client_order_id else None
+            retry_client_id = (
+                _safe_client_order_id(f"{client_order_id[:24]}_r")
+                if client_order_id
+                else None
+            )
             retry_resp = await self.gateway.create_exit_order(
                 symbol=self.symbol,
                 side=side,
