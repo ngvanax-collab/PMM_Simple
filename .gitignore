@@ -20,3 +20,5 @@ __pycache__/
 .venv/
 venv/
 Funding_Rate_Arbitrage/
+.aider*
+backtest/data_historical/

@@ -97,6 +97,7 @@ class PMMQuoter:
            If best_bid is provided, Ask MUST be >= best_bid + tick_size.
            If best_ask is provided, Ask >= best_ask.
         4. Apply price_floor and price_ceiling bounds.
+        Note: spread_floor is computed as 2 * tick_pct + 2 * maker_fee_pct + max(0.0015, minimum_spread) and then clamped to a minimum of 0.0025, ensuring the spread covers at least 0.25% after fees.
         """
         quantized = self.quantize_price(raw_price, is_bid=is_bid)
         min_half_spread = max((spread_floor / 2.0) * mid_price, self.tick_size)
